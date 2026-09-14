@@ -364,7 +364,7 @@ def _cmd_show(cfg) -> None:
     V = len(tok)
 
     batcher = Batcher(arr, batch_size=2, seed=cfg.data.seed)
-    x, y = batcher.random_batch()
+    x, y = batcher.next_batch()
 
     print(f"tokenizer      : {meta['tokenizer']['name_or_path']}  len={V}  eos={tok.eos_token_id}")
     print(f"inputs  shape  : {tuple(x.shape)}  dtype={x.dtype}")

@@ -13,11 +13,14 @@ tested here; it needs an actual CUDA device. See the GPU resume cell in
 notebooks/story_moe_colab.ipynb.
 """
 
+import ast
 import copy
+import pathlib
 
 import numpy as np
 import pytest
 
+import story_moe
 from _helpers import tiny_cfg
 from story_moe.data import Batcher, check_cache_matches_config
 
@@ -156,3 +159,35 @@ def test_validation_split_checks_against_val_stories():
     check_cache_matches_config(meta, cfg, "validation")
     with pytest.raises(ValueError, match="stories"):
         check_cache_matches_config(meta, cfg, "train")
+
+
+# --- call sites stay in sync with the Batcher API --------------------------
+
+
+def test_no_call_site_uses_a_missing_batcher_method():
+    """Catch a rename that updates some call sites and not others.
+
+    This exact bug shipped: `Batcher.random_batch` became `next_batch`,
+    `train.py` was updated, the CLI in `data.py` was not, and the whole suite
+    passed because nothing exercises that display path. The failure surfaced as
+    an AttributeError three steps into a Colab session.
+
+    Static rather than behavioural: it walks every `batcher.<attr>` in the
+    package and checks the attribute exists. It only sees call sites where the
+    variable is literally named `batcher`, which is the convention here.
+    """
+    known = {name for name in dir(Batcher) if not name.startswith("_")}
+    problems = []
+
+    for path in sorted(pathlib.Path(story_moe.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "batcher"
+                and node.attr not in known
+            ):
+                problems.append(f"{path.name}:{node.lineno} calls batcher.{node.attr}")
+
+    assert not problems, "Batcher call sites out of sync:\n  " + "\n  ".join(problems)
