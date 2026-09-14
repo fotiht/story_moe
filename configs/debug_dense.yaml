@@ -1,0 +1,43 @@
+# Debug-tier dense baseline: small enough to run correctness checks on CPU.
+# The MoE config must keep every field below identical except the feed-forward
+# block, or the dense-vs-MoE comparison is not controlled.
+name: debug_dense
+
+model:
+  n_layers: 2
+  d_model: 128
+  n_heads: 4
+  d_head: 32           # d_model == n_heads * d_head is enforced in config.py
+  max_seq_len: 256     # 256, not 128, so the benchmark grid (prompt 128 + 64 replay) fits
+  use_moe: false
+  dense_width: 512     # 2 * expert_width: approximate active-MLP compute match vs Top-2
+  rope_base: 10000.0       # position comes only from RoPE; there is no learned position table
+  dropout: 0.0
+  tie_weights: true
+  bias: false
+
+data:
+  dataset: roneneldan/TinyStories
+  tokenizer: gpt2
+  train_stories: 1000   # pipeline debugging only -- see PROJECT_STATUS before the real run
+  val_stories: 200
+  seed: 1234
+  block_size: 128
+  stride: null          # null -> block_size: windows share one boundary token, nothing wasted
+  cache_dir: data/cache
+
+train:
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 20        # max_tokens/4096 = 244 updates, so 100 would be 41% of the run
+  microbatch_size: 4
+  accum_steps: 8
+  max_tokens: 1000000
+  eval_every: 250
+  ckpt_every: 250
+  out_dir: checkpoints/debug_dense
+  device: cuda
+  precision: fp32
+  require_gpu_name: null   # set to e.g. "A100" to refuse to run on a reassigned Colab GPU

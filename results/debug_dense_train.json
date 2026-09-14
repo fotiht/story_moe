@@ -1,0 +1,112 @@
+{
+  "config": {
+    "name": "debug_dense",
+    "model": {
+      "n_layers": 2,
+      "d_model": 128,
+      "n_heads": 4,
+      "d_head": 32,
+      "max_seq_len": 256,
+      "use_moe": false,
+      "dense_width": 512,
+      "n_experts": 4,
+      "top_k": 2,
+      "expert_width": 256,
+      "aux_loss_weight": 0.01,
+      "rope_base": 10000.0,
+      "dropout": 0.0,
+      "tie_weights": true,
+      "bias": false,
+      "vocab_size": 50257
+    },
+    "data": {
+      "dataset": "roneneldan/TinyStories",
+      "tokenizer": "gpt2",
+      "train_stories": 1000,
+      "val_stories": 200,
+      "seed": 1234,
+      "block_size": 128,
+      "stride": null,
+      "cache_dir": "data/cache"
+    },
+    "train": {
+      "lr": 0.0003,
+      "weight_decay": 0.1,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "grad_clip": 1.0,
+      "warmup_steps": 20,
+      "microbatch_size": 4,
+      "accum_steps": 8,
+      "max_tokens": 1000000,
+      "eval_every": 250,
+      "ckpt_every": 250,
+      "out_dir": "checkpoints/debug_dense",
+      "device": "cpu",
+      "precision": "fp32",
+      "require_gpu_name": null
+    }
+  },
+  "parameters": {
+    "total": 6827392,
+    "embedding": 6432896,
+    "body": 394496
+  },
+  "total_updates": 20,
+  "tokens_per_update": 4096,
+  "processed_tokens": 81920,
+  "unique_dataset_tokens": 225790,
+  "passes_over_data": 0.3628150050932282,
+  "best_val_nll": 10.031481576880172,
+  "best_val_perplexity": 22730.92422135264,
+  "history": [
+    {
+      "step": 0,
+      "lm_loss": 10.820649027824402,
+      "aux_loss": 0.0,
+      "total_loss": 10.820649027824402,
+      "lr": 1.4999999999999999e-05,
+      "grad_norm": 1.5236327648162842,
+      "processed_tokens": 4096,
+      "elapsed_s": 1.554957389831543,
+      "tokens_per_s": 2634.155782521952,
+      "peak_mem_mib": 0.0
+    },
+    {
+      "step": 10,
+      "lm_loss": 10.47655177116394,
+      "aux_loss": 0.0,
+      "total_loss": 10.47655177116394,
+      "lr": 0.00016499999999999997,
+      "grad_norm": 1.4084147214889526,
+      "processed_tokens": 45056,
+      "elapsed_s": 18.191208124160767,
+      "tokens_per_s": 2476.800864048089,
+      "peak_mem_mib": 0.0
+    },
+    {
+      "step": 19,
+      "lm_loss": 10.068604588508606,
+      "aux_loss": 0.0,
+      "total_loss": 10.068604588508606,
+      "lr": 0.0003,
+      "grad_norm": 1.3867518901824951,
+      "processed_tokens": 81920,
+      "elapsed_s": 37.377729415893555,
+      "tokens_per_s": 2191.679411247662,
+      "peak_mem_mib": 0.0
+    },
+    {
+      "step": 19,
+      "validation": {
+        "total_nll": 435286.0485839844,
+        "scored_tokens": 43392,
+        "batches": 85,
+        "mean_nll": 10.031481576880172,
+        "perplexity": 22730.92422135264
+      }
+    }
+  ]
+}

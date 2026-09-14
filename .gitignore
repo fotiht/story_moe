@@ -1,0 +1,14 @@
+# Local artifacts. NOTE: this repo lives inside OneDrive, which syncs regardless
+# of .gitignore. These paths are kept out of Git history, not out of OneDrive.
+data/
+checkpoints/
+*.bin
+*.pt
+*.ckpt
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
