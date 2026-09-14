@@ -51,18 +51,15 @@ class RouterStats:
     aux_loss: float
     tokens: int
 
-    def as_dict(self) -> dict:
-        return {
-            "assignment_fraction": self.assignment_fraction,
-            "mean_probability": self.mean_probability,
-            "router_entropy": self.router_entropy,
-            "aux_loss": self.aux_loss,
-            "tokens": self.tokens,
-        }
 
+class FeedForward(nn.Module):
+    """Linear(D, width) -> GELU -> Linear(width, D).
 
-class Expert(nn.Module):
-    """One expert: Linear(D, m) -> GELU -> Linear(m, D). Same shape as the dense MLP."""
+    The dense model uses one of these at width `dense_width`; the MoE uses
+    `n_experts` of them at `expert_width`. It lives here rather than in model.py
+    because model.py already imports this module, and the reverse would be a
+    cycle.
+    """
 
     def __init__(self, d_model: int, width: int, dropout: float = 0.0, bias: bool = False):
         super().__init__()
@@ -84,7 +81,8 @@ class SparseMoE(nn.Module):
 
         self.router = nn.Linear(m.d_model, m.n_experts, bias=False)
         self.experts = nn.ModuleList(
-            Expert(m.d_model, m.expert_width, m.dropout, m.bias) for _ in range(m.n_experts)
+            FeedForward(m.d_model, m.expert_width, m.dropout, m.bias)
+            for _ in range(m.n_experts)
         )
 
     # -- routing -----------------------------------------------------------
@@ -185,11 +183,3 @@ class SparseMoE(nn.Module):
         stats = self._stats(probs, topk_idx, aux) if collect_stats else None
         return out.view(B, T, D), aux, stats
 
-
-def balanced_reference_value(n_experts: int) -> float:
-    """What balance_loss returns under perfectly uniform routing. Always 1.0.
-
-    Kept as a named function so logs and the README can state the target
-    instead of implying the auxiliary loss should approach zero.
-    """
-    return 1.0

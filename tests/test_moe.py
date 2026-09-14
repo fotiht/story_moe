@@ -13,7 +13,7 @@ import torch
 
 from _helpers import VOCAB, tiny_cfg
 from story_moe.model import StoryLM, count_parameters
-from story_moe.moe import SparseMoE, balanced_reference_value
+from story_moe.moe import SparseMoE
 
 E, K, D, WIDTH = 4, 2, 32, 48
 
@@ -225,7 +225,6 @@ def test_balance_loss_is_one_under_uniform_routing(moe):
 
     loss = moe.balance_loss(probs, topk_idx)
     torch.testing.assert_close(loss, torch.tensor(1.0), rtol=1e-4, atol=1e-5)
-    assert balanced_reference_value(E) == 1.0
 
 
 def test_constant_router_gives_uniform_probabilities(moe):

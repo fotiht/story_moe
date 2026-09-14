@@ -1,4 +1,4 @@
-"""Dense MLP, pre-norm decoder block, and the language model.
+"""Pre-norm decoder block and the language model.
 
 DAY 4 SCOPE. Attention, the loss, RoPE, and the sparse Top-k MoE feed-forward.
 The temporary learned positional embedding from Day 2 was DELETED, not disabled.
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from .attention import CausalSelfAttention
 from .config import Config
-from .moe import RouterStats, SparseMoE
+from .moe import FeedForward, RouterStats, SparseMoE
 from .rope import rope_tables
 
 
@@ -46,19 +46,6 @@ class ModelOutput:
     router_stats: list[RouterStats] | None = None  # detached, opt-in
 
 
-class DenseMLP(nn.Module):
-    """Linear(D, width) -> GELU -> Linear(width, D). Also the shape of one expert."""
-
-    def __init__(self, d_model: int, width: int, dropout: float = 0.0, bias: bool = False):
-        super().__init__()
-        self.fc_in = nn.Linear(d_model, width, bias=bias)
-        self.fc_out = nn.Linear(width, d_model, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.fc_out(F.gelu(self.fc_in(x))))
-
-
 class DecoderBlock(nn.Module):
     """Pre-norm: x = x + attn(norm1(x)); x = x + ff(norm2(x))."""
 
@@ -72,7 +59,7 @@ class DecoderBlock(nn.Module):
         self.use_moe = m.use_moe
         self.feed_forward = (
             SparseMoE(cfg) if m.use_moe
-            else DenseMLP(m.d_model, m.dense_width, m.dropout, m.bias)
+            else FeedForward(m.d_model, m.dense_width, m.dropout, m.bias)
         )
 
     def forward(

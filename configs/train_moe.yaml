@@ -14,6 +14,7 @@ model:
   n_experts: 4
   top_k: 2
   expert_width: 2048     # dense_width in the baseline is 2 * this
+  dense_width: 4096      # unused here; stated so the recorded config shows the matched pair
   aux_loss_weight: 0.01
   rope_base: 10000.0
   dropout: 0.0

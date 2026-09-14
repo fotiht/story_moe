@@ -18,6 +18,7 @@ model:
   max_seq_len: 512
   use_moe: false
   dense_width: 4096      # 2 * expert_width: approximate active-MLP compute match
+  expert_width: 2048     # unused here; stated so the recorded config shows the matched pair
   rope_base: 10000.0
   dropout: 0.0
   tie_weights: true

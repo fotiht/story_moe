@@ -267,7 +267,6 @@ class Batcher:
     def __init__(self, blocks: np.ndarray, batch_size: int, seed: int = 0, shuffle: bool = True):
         import torch
 
-        self.torch = torch
         self.blocks = blocks
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -277,7 +276,8 @@ class Batcher:
         self._perm = self._new_permutation()
 
     def _new_permutation(self):
-        torch = self.torch
+        import torch
+
         n = self.blocks.shape[0]
         if self.shuffle:
             return torch.randperm(n, generator=self.generator)
@@ -285,7 +285,8 @@ class Batcher:
 
     def next_batch(self, device: str = "cpu"):
         """The next batch_size blocks in permutation order, wrapping at epoch end."""
-        torch = self.torch
+        import torch
+
         taken = []
         remaining = self.batch_size
         while remaining > 0:
@@ -328,13 +329,6 @@ class Batcher:
         self.cursor = int(state["cursor"])
         self.epoch = int(state["epoch"])
 
-    def sequential_batches(self, device: str = "cpu"):
-        """Every block exactly once, in order. Used for validation."""
-        torch = self.torch
-        for start in range(0, self.blocks.shape[0], self.batch_size):
-            chunk = self.blocks[start : start + self.batch_size].astype(np.int64)
-            window = torch.from_numpy(chunk)
-            yield window[:, :-1].to(device), window[:, 1:].to(device)
 
 
 # ---------------------------------------------------------------------------
