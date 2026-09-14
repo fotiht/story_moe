@@ -118,6 +118,7 @@ Fixed for both models. Changing any of it invalidates the comparison.
 | Padding | none — there is no pad token and no padded batch |
 | Packing | stories concatenated per split, cut into windows of `block_size + 1` |
 | Stride | `block_size` (default) — consecutive windows share one boundary token |
+| Sampling | shuffled permutation per epoch, **without replacement** |
 | Shift | `inputs = window[:-1]`, `targets = window[1:]` |
 | Remainder | discarded, never padded, never scored; count recorded in `data/cache/<split>.json` |
 | Story boundaries | attention **does** cross them inside a block; EOS does not reset attention |
@@ -141,8 +142,9 @@ version exists solely as a test oracle.
 The balancing objective is a Top-k adaptation of the Switch loss:
 `f_e` is expert e's share of the k*N assignments, `P_e` the mean full softmax
 probability, and `L = E * sum_e f_e * P_e`. **Under uniform routing this equals
-1, not 0** — an auxiliary loss near 1 is healthy and should not be driven down.
-Gradients reach the router through `P_e` (the probabilities before top-k
+1, not 0**, so it should never be driven toward zero — but see "Reading the
+routing diagnostics" below: a value of 1 is *not* evidence that routing is
+balanced. Gradients reach the router through `P_e` (the probabilities before top-k
 truncation) and through the renormalized selected weights, which are never
 detached. The top-k indices themselves are discrete and carry no gradient.
 
@@ -153,8 +155,10 @@ enabling the KV cache changes the arguments and not the masking logic.
 ### Parameter accounting
 
 With the GPT-2 vocabulary (50,257) the tied embedding dominates a small model,
-so **body (non-embedding) parameters are the number to compare**, not the total.
-RoPE contributes no parameters, so "embedding" is exactly the token embedding.
+so **report both the total and the non-embedding ("body") count** — neither
+substitutes for the other. The total is what a reader means by "model size"; the
+body is what actually differs between the two architectures. RoPE contributes no
+parameters, so "embedding" is exactly the tied token embedding.
 
 The debug dense row is confirmed against an instantiated model: `body = 394,496`
 = 131,072 attention + 262,144 MLP + 1,280 LayerNorm, and `embedding = 6,432,896`
@@ -167,10 +171,14 @@ The debug dense row is confirmed against an instantiated model: `body = 394,496`
 | **Experiment dense** (6L, D=384, m=4096) | 19.30M | 3.54M | 18.87M | **41.72M** | 46% |
 | **Experiment MoE** (6L, D=384, 4×m=2048) | 19.30M | 3.54M | 37.75M | **60.60M** | 32% |
 
-The debug tier is a plumbing demonstration, and the measured A100 probe confirms
-why: 94% of its forward FLOPs are the embedding and output projection, so the
-feed-forward change moves neither quality nor throughput much, and the two
-models differ by only 3.8% in total parameters. The main experiment therefore
+The debug tier is a plumbing demonstration. Counting forward matmul FLOPs per
+token (output projection `2VD`; attention projections `2·4D²L`; the QK^T and AV
+matmuls `2·2TDL`; MLP `2·2DmL`), the debug tier spends **93.3% on the tied output
+projection**, 3.8% on the MLP and 2.9% on attention. The feed-forward change
+therefore touches under 4% of the compute, and the two models differ by only
+3.8% in total parameters. At the experiment tier the split is 43.8% output
+projection / 42.8% MLP / 13.4% attention — the MoE swap now touches over 40% of
+the forward cost. The main experiment therefore
 runs at 6 layers / d_model 384 — `configs/train_dense.yaml` and
 `configs/train_moe.yaml`, 41.72M vs 60.60M parameters, bodies 22.42M vs 41.30M.
 
@@ -236,3 +244,24 @@ run on an A100 in bf16 and an MoE run on a T4 in fp16 are not comparable.
 - Mixtral of Experts (token-wise Top-2 selection): https://arxiv.org/abs/2401.04088
 - PyTorch SDPA mask/dropout semantics:
   https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+
+## Sampling and coverage
+
+Training batches come from a shuffled permutation consumed in order, reshuffled
+at each epoch boundary. This is deliberate: with `torch.randint` (sampling with
+replacement), drawing n batches' worth from n blocks reaches only
+`1 - (1-1/n)^n ≈ 63%` of them, so a budget described as "one pass" would leave a
+third of the data unseen while showing other blocks twice. With a permutation,
+"0.98 passes" means 98% of blocks, each exactly once. The sampler's permutation,
+cursor and epoch are saved in every checkpoint, so a resume continues from the
+same position rather than reshuffling.
+
+## Reading the routing diagnostics
+
+`assignment_fraction` is the balance diagnostic. The auxiliary loss is **not**:
+with `L = E · Σ f_e P_e`, near-uniform probabilities `P_e ≈ 1/E` give
+`L = E · (1/E) · Σ f_e = 1` for *any* assignment distribution, including total
+collapse onto one expert. An untrained router has near-uniform probabilities, so
+an auxiliary loss sitting at 1.0 early in training carries almost no information
+about load balance. Read the per-layer assignment fractions, aggregated over a
+batch of updates rather than one.

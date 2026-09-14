@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from .config import Config, load_config
-from .data import Batcher, load_cached_split, load_tokenizer
+from .data import Batcher, check_cache_matches_config, load_cached_split, load_tokenizer
 from .evaluate import describe_protocol, evaluate_blocks
 from .model import StoryLM, count_parameters, expected_initial_loss
 
@@ -153,6 +153,14 @@ def save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _to_cpu(x):
+    """RNG states must be CPU byte tensors. torch.load(map_location='cuda') moves
+    every tensor in the payload, RNG states included, and torch.set_rng_state
+    then rejects them. Loading on CPU avoids this; normalizing here as well means
+    a checkpoint written by an older version still restores."""
+    return x.cpu() if isinstance(x, torch.Tensor) else x
+
+
 def checkpoint_payload(
     model, optimizer, scaler, cfg, tok, step, processed_tokens, batcher, best_val
 ) -> dict[str, Any]:
@@ -171,11 +179,19 @@ def checkpoint_payload(
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
-        "batcher_generator": batcher.generator.get_state(),
+        "batcher": batcher.state_dict(),
+        "epochs_seen": batcher.epochs_seen(),
     }
 
 
 def restore_checkpoint(payload: dict[str, Any], model, optimizer, scaler, batcher) -> dict:
+    """Restore training state. The payload must be loaded with map_location='cpu'.
+
+    load_state_dict copies into the model's existing (already on-device) tensors,
+    and torch.optim moves optimizer state to each parameter's device, so nothing
+    is lost by loading on CPU -- while RNG states, which must stay CPU byte
+    tensors, survive.
+    """
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None and payload.get("scaler") is not None:
@@ -187,11 +203,11 @@ def restore_checkpoint(payload: dict[str, Any], model, optimizer, scaler, batche
     if rng.get("numpy") is not None:
         np.random.set_state(rng["numpy"])
     if rng.get("torch") is not None:
-        torch.set_rng_state(rng["torch"])
+        torch.set_rng_state(_to_cpu(rng["torch"]))
     if rng.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng["cuda"])
-    if payload.get("batcher_generator") is not None:
-        batcher.generator.set_state(payload["batcher_generator"])
+        torch.cuda.set_rng_state_all([_to_cpu(s) for s in rng["cuda"]])
+    if payload.get("batcher") is not None:
+        batcher.load_state_dict(payload["batcher"])
 
     return {
         "step": payload["step"],
@@ -222,6 +238,7 @@ def overfit(
     tok = resolve_vocab_size(cfg)
 
     blocks, meta = load_cached_split(Path(cfg.data.cache_dir), "train")
+    check_cache_matches_config(meta, cfg, "train")
     window = torch.from_numpy(blocks[:n_blocks].astype(np.int64)).to(device)
     x, y = window[:, :-1], window[:, 1:]
 
@@ -300,9 +317,14 @@ def train(
     cache = Path(cfg.data.cache_dir)
     train_blocks, train_meta = load_cached_split(cache, "train")
     val_blocks, val_meta = load_cached_split(cache, "validation")
+    # Before anything is counted: a mismatched cache runs fine and reports
+    # processed-token numbers that are wrong by the block-size ratio.
+    check_cache_matches_config(train_meta, cfg, "train")
+    check_cache_matches_config(val_meta, cfg, "validation")
 
     model = build_model(cfg, device)
     counts = report_parameters(model)
+    is_moe = cfg.model.use_moe
     opt = make_optimizer(model, cfg)
     batcher = Batcher(train_blocks, cfg.train.microbatch_size, seed=cfg.data.seed)
 
@@ -310,6 +332,7 @@ def train(
     tokens_per_update = cfg.train.microbatch_size * cfg.train.accum_steps * T
     total_updates = max_updates or max(1, cfg.train.max_tokens // tokens_per_update)
     unique_tokens = train_meta["unique_stream_tokens"]
+    # Sampling is without replacement, so this ratio really is data coverage.
     epochs = (total_updates * tokens_per_update) / unique_tokens
 
     print(f"tokenizer      : {tok.name_or_path}  V={cfg.model.vocab_size}")
@@ -321,7 +344,7 @@ def train(
     )
     print(
         f"                 unique dataset tokens = {unique_tokens:,}  ->  "
-        f"{epochs:.1f} passes over the same text"
+        f"{epochs:.2f} passes (sampling without replacement)"
     )
     if epochs > 2.0:
         print("                 WARNING: repeated passes. Report processed and unique "
@@ -333,7 +356,10 @@ def train(
 
     start_step, processed_tokens, best_val = 0, 0, float("inf")
     if resume:
-        payload = torch.load(resume, map_location=device, weights_only=False)
+        # CPU, always: map_location="cuda" would move the RNG byte tensors to
+        # the GPU and torch.set_rng_state rejects them. A CPU-only resume test
+        # cannot catch this, which is why it is asserted here rather than there.
+        payload = torch.load(resume, map_location="cpu", weights_only=False)
         state = restore_checkpoint(payload, model, opt, scaler, batcher)
         start_step = state["step"]
         processed_tokens = state["processed_tokens"]
@@ -352,12 +378,26 @@ def train(
         for group in opt.param_groups:
             group["lr"] = lr
 
+        # Collecting routing statistics on logging steps only keeps the cost off
+        # the hot path; they are aggregated over every microbatch of the update,
+        # because one microbatch of expert usage is far too noisy to read.
+        want_stats = is_moe and (step % log_every == 0 or step == total_updates - 1)
+        frac_sum = [0.0] * cfg.model.n_experts
+        prob_sum = [0.0] * cfg.model.n_experts
+        stat_layers = 0
+
         opt.zero_grad(set_to_none=True)
         lm_sum = aux_sum = 0.0
         for _ in range(cfg.train.accum_steps):
-            x, y = batcher.random_batch(device)
+            x, y = batcher.next_batch(device)
             with autocast_factory():
-                out = model(x, targets=y)
+                out = model(x, targets=y, collect_stats=want_stats)
+            if want_stats and out.router_stats:
+                for st in out.router_stats:
+                    stat_layers += 1
+                    for e in range(cfg.model.n_experts):
+                        frac_sum[e] += st.assignment_fraction[e]
+                        prob_sum[e] += st.mean_probability[e]
             # Divide before backward so the accumulated gradient is the mean,
             # not the sum, over microbatches.
             loss = out.total_loss / cfg.train.accum_steps
@@ -395,13 +435,24 @@ def train(
                 "elapsed_s": elapsed,
                 "tokens_per_s": tps,
                 "peak_mem_mib": mem,
+                "epochs_seen": batcher.epochs_seen(),
             }
+            if want_stats and stat_layers:
+                row["assignment_fraction"] = [v / stat_layers for v in frac_sum]
+                row["mean_probability"] = [v / stat_layers for v in prob_sum]
             history.append(row)
             print(
                 f"step {step:5d}/{total_updates}  lm {row['lm_loss']:7.4f}  "
                 f"aux {row['aux_loss']:6.4f}  lr {lr:.2e}  gn {row['grad_norm']:5.2f}  "
                 f"tok {processed_tokens:>10,}  {tps:8.0f} tok/s"
             )
+            if "assignment_fraction" in row:
+                frac = " ".join(f"{v:.3f}" for v in row["assignment_fraction"])
+                prob = " ".join(f"{v:.3f}" for v in row["mean_probability"])
+                # The assignment fractions are the real balance diagnostic. The
+                # auxiliary loss is NOT: with near-uniform probabilities it sits
+                # at 1.0 even when every token goes to the same expert.
+                print(f"  routing      assign [{frac}]  prob [{prob}]")
 
         is_last = step == total_updates - 1
         if (step + 1) % cfg.train.eval_every == 0 or is_last:
@@ -437,6 +488,8 @@ def train(
         "processed_tokens": processed_tokens,
         "unique_dataset_tokens": unique_tokens,
         "passes_over_data": epochs,
+        "epochs_seen": batcher.epochs_seen(),
+        "sampling": "without replacement (shuffled permutation per epoch)",
         "best_val_nll": best_val,
         "best_val_perplexity": math.exp(best_val) if best_val < float("inf") else None,
         "history": history,

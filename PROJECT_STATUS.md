@@ -4,7 +4,32 @@ Updated: 2026-09-14
 
 ## Current milestone
 
-**Days 1–3 verified. A100 probe measured. Day 4 (sparse MoE) written, not yet run.**
+**Days 1–4 verified. A100 probe measured. Reliability fixes applied (unverified).
+Day 5 (MoE run) is next.**
+
+### Reliability fixes from external review — WRITTEN, NEED `pytest -q`
+
+Three real bugs, all of which produce plausible runs rather than crashes:
+
+1. **GPU resume was broken.** `torch.load(..., map_location=device)` moved the
+   saved RNG byte tensors onto the GPU, and `torch.set_rng_state` requires a CPU
+   byte tensor. The CPU resume-smoke test could not catch this because
+   map_location was "cpu" there. Now always loaded on CPU (`load_state_dict`
+   copies into the model's on-device tensors, and the optimizer moves its own
+   state), with a defensive `.cpu()` on every RNG tensor.
+   **Still needs a real GPU resume smoke test — see the notebook.**
+2. **No cache/config agreement check.** Pointing a 512-token config at the
+   128-token cache ran fine and reported 4x the true processed tokens.
+   `check_cache_matches_config` now validates block size, stride, tokenizer
+   identity, vocab size, dataset, seed and story count before training starts.
+3. **Sampling was with replacement.** `torch.randint` over n blocks reaches only
+   `1-(1-1/n)^n ~= 63%` of them in n draws, so "0.98 passes" was a budget ratio,
+   not coverage. `Batcher` now consumes a shuffled permutation and reshuffles at
+   epoch boundaries; permutation, cursor and epoch are checkpointed.
+
+Plus: routing statistics are now collected on logging steps and aggregated over
+every microbatch of the update, and several overstated claims were corrected
+(see the Day 4 note on the auxiliary loss, and the FLOP accounting above).
 
 ## Working constraint
 
@@ -49,14 +74,18 @@ roughly 22x. At 55,800 tok/s, 20M tokens is about 6 minutes at the debug tier.
 
 ## Decisions from the probe
 
-**Tier: the 6-layer / d_model 384 configuration carries the comparison.** At the
-debug tier 94% of forward FLOPs are the embedding and output projection, so the
-feed-forward change barely moves quality or throughput, and the models differ by
-3.8% in parameters. At the larger tier it is 41.72M vs 60.60M total (bodies
+**Tier: the 6-layer / d_model 384 configuration carries the comparison.**
+Counting forward matmul FLOPs per token (output projection `2VD`, attention
+projections `2*4D^2*L`, QK^T and AV `2*2TDL`, MLP `2*2DmL`), the debug tier is
+93.3% output projection / 3.8% MLP / 2.9% attention — the feed-forward change
+touches under 4% of the compute, and the models differ by 3.8% in parameters.
+The experiment tier is 43.8% / 42.8% / 13.4%, so the MoE swap touches over 40%. At the larger tier it is 41.72M vs 60.60M total (bodies
 22.42M vs 41.30M) and a 46% embedding share. New: `configs/train_dense.yaml`,
 `configs/train_moe.yaml`.
 
-**Budget: 20M processed tokens over 90,000 stories = 0.98 passes.** The spec's
+**Budget: 20M processed tokens over 90,000 stories = 0.98 passes.** (Sampling is
+now without replacement, so this ratio is genuine coverage; with the previous
+`torch.randint` sampler the same budget would have reached only ~63% of blocks.) The spec's
 1–5M suggestion is 18–90 seconds on this GPU; there is no reason to be that
 small. 90k stories x 226 tokens ≈ 20.3M unique, so the run is close to a single
 epoch rather than 4–22 repeats.
@@ -65,42 +94,68 @@ Experiment settings: block_size 512, microbatch 8, accum 4 → 16,384 tokens per
 update, 1,220 updates, warmup 60 (5%), bf16, `require_gpu_name: A100`, cache at
 `data/cache_512` (separate from the 128-token debug cache).
 
-## Day 4 — WRITTEN, UNVERIFIED
+## Day 4 — PASSED
 
-`src/story_moe/moe.py` plus `tests/test_moe.py` (24 tests).
+`pytest -q` → 61 passed. The gate, `test_gradients_match_dense_oracle`, passed:
+input, expert and router gradients all agree with a dense all-experts oracle
+using identical Top-2 weights.
+
+MoE overfit on `configs/debug_moe.yaml`:
+
+```
+parameters : total=7,090,560  embedding=6,432,896 (90.7%)  body=657,664
+step   0   lm_loss 10.8397  aux 1.0061  acc   1.56%
+step  50   lm_loss  1.5534  aux 1.0175  acc  87.50%
+step 200   lm_loss  0.0025  aux 0.9989  acc 100.00%
+step-0 loss 10.8397 vs ln(V) = 10.825, off by 0.015     verdict: PASS
+```
+
+`body = 657,664` reproduces exactly: 131,072 attention + 524,288 experts
+(4 x 2 x 128 x 256 x 2 layers) + 1,280 LayerNorm + 1,024 router. MoE body /
+dense body = 657,664 / 394,496 = 1.667, matching the config-shape derivation.
+
+**`aux` stayed in 0.9989–1.0175 for all 200 steps.** CORRECTION to an earlier
+reading of this: that does NOT demonstrate balanced routing. With
+`L = E * sum_e f_e * P_e`, near-uniform probabilities `P_e ~= 1/E` give
+`L = E * (1/E) * sum_e f_e = 1` for ANY assignment distribution — including every
+token collapsing onto one expert. Worked counterexample: E=4, P uniform,
+f = [1, 0, 0, 0] still yields exactly 1.0000. An untrained router has
+near-uniform probabilities, so aux ~= 1 early in training is close to
+uninformative. The real diagnostic is `assignment_fraction`, which is why the
+training loop now logs it.
+
+MoE converged slightly slower than dense (step 25: 5.06 vs 4.85), which is
+expected: the router is an additional thing to learn.
+
+### What Day 4 added
 
 - `SparseMoE.route` — float32 softmax, `topk`, selected weights renormalized to
-  sum to 1. **Not detached**: the language loss trains the router through them.
-- Dispatch — per expert, gather its assigned rows, one MLP call, weight, and
-  `index_add` back. k*N token-expert evaluations, not E*N.
+  sum to 1, **not detached** so the language loss trains the router.
+- Dispatch — per expert: gather assigned rows, one MLP call, weight,
+  `index_add` back. k*N token-expert evaluations, not E*N, with a test that
+  counts them.
 - `balance_loss` — `f_e` over k*N assignments (detached), `P_e` the mean full
-  probability before truncation, `L = E * sum_e f_e * P_e`. **Balanced value is
-  1, not 0.**
-- `RouterStats` — assignment fractions, mean probabilities, router entropy,
-  aux loss, token count. Detached, opt-in via `collect_stats`.
-- `need_aux=False` skips the balancing reduction entirely, so no diagnostic work
-  distinguishes the cached and uncached benchmark paths later.
-- `DecoderBlock` now returns `(x, aux, stats)`; `StoryLM` averages aux across MoE
-  layers and computes `total = lm + aux_weight * aux`. Dense aux is exactly 0.
-
-The gate is `test_gradients_match_dense_oracle`: input, expert **and** router
-gradients must match a dense all-experts oracle using identical Top-2 weights.
-Routing that produces correct outputs with wrong gradients is the classic silent
-MoE failure.
+  probability before truncation, `L = E * sum_e f_e * P_e`. Balanced value 1.
+- `RouterStats` — assignment fractions, mean probabilities, entropy, aux loss,
+  token count. Detached, opt-in.
+- `need_aux=False` skips the balancing reduction in inference, so no diagnostic
+  work distinguishes the cached and uncached benchmark paths on Day 7.
+- `DecoderBlock` returns `(x, aux, stats)`; `StoryLM` averages aux across MoE
+  layers. Dense aux is exactly 0.
 
 ## Next action
 
-```bash
-pytest -q                                   # expect ~64 tests
-python -m story_moe.train overfit --config configs/debug_moe.yaml --steps 200
-```
+Day 5: in Colab (notebook section 7), prepare the 512-token cache, then run
+`train_dense.yaml` and `train_moe.yaml` on the same GPU, precision and budget.
+Before committing to the full 1,220 updates, do a ~50-update run of each and
+compare tokens/s — open item 2 below.
 
-The MoE overfit should collapse like the dense one did, with `aux` sitting near
-1.0 throughout — not falling toward zero.
+Per-layer routing statistics already exist (`collect_stats=True` →
+`ModelOutput.router_stats`); Day 5 wires them into the training log and the
+results JSON so expert usage can be inspected over an aggregate of batches
+rather than one noisy one.
 
-Then, in Colab (notebook section 7): prepare the 512 cache, run
-`train_dense.yaml`, then `train_moe.yaml` on the same GPU, same precision, same
-budget.
+Then Day 6 (KV cache) and Day 7 (evaluation, benchmarks, README).
 
 ## Decisions log
 
@@ -119,10 +174,13 @@ budget.
 
 1. **Microbatch is likely far too small for an A100.** The probe pushed 4 x 128 =
    512 tokens per forward; the bf16 logits tensor was 49 MiB against 40 GB of
-   memory. Raising microbatch and lowering accum by the same factor leaves the
-   effective batch and the optimization trajectory identical but should improve
-   throughput substantially. The experiment config uses 8 x 4; worth a quick
-   sweep before the real runs.
+   memory. Raising microbatch and lowering accum by the same factor keeps the
+   effective batch and the *language* loss identical up to floating point — but
+   NOT the objective as a whole: `balance_loss` estimates `f_e` and `P_e` from
+   one microbatch, so changing the microbatch size changes the auxiliary
+   gradient. Treat a microbatch change as a config change to disclose, not a
+   free optimization. Worth a sweep before the real runs; keep it identical
+   across the dense and MoE runs either way.
 2. **Measure MoE throughput before treating the dense run as final.** Gather/
    scatter dispatch can be slower per token; if it is much slower, the matched
    token budget may not fit the wall clock.

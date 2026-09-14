@@ -197,13 +197,72 @@ def load_cached_split(cache_dir: Path, split: str) -> tuple[np.ndarray, dict[str
     return arr, meta
 
 
+def check_cache_matches_config(meta: dict[str, Any], cfg, split: str) -> None:
+    """Refuse to train on a cache that does not match the active config.
+
+    Without this, pointing a 512-token config at the 128-token cache runs
+    perfectly happily: the batcher just yields shorter rows, the model accepts
+    them, and every processed-token count in the logs and the results JSON is
+    wrong by a factor of four. Silent bad accounting is worse than a crash.
+    """
+    expected = {
+        "block_size": cfg.data.block_size,
+        "stride": cfg.data.resolved_stride(),
+    }
+    problems = [
+        f"{key}: cache has {meta.get(key)!r}, config wants {want!r}"
+        for key, want in expected.items()
+        if meta.get(key) != want
+    ]
+
+    tok = meta.get("tokenizer", {})
+    if tok.get("name_or_path") != cfg.data.tokenizer:
+        problems.append(
+            f"tokenizer: cache has {tok.get('name_or_path')!r}, config wants {cfg.data.tokenizer!r}"
+        )
+    if cfg.model.vocab_size is not None and tok.get("vocab_size_len") != cfg.model.vocab_size:
+        problems.append(
+            f"vocab size: cache has {tok.get('vocab_size_len')}, model has {cfg.model.vocab_size}"
+        )
+
+    prov = meta.get("provenance", {})
+    if prov.get("dataset") != cfg.data.dataset:
+        problems.append(f"dataset: cache has {prov.get('dataset')!r}, config wants {cfg.data.dataset!r}")
+    if prov.get("seed") != cfg.data.seed:
+        problems.append(f"seed: cache has {prov.get('seed')}, config wants {cfg.data.seed}")
+
+    wanted_stories = cfg.data.train_stories if split == "train" else cfg.data.val_stories
+    if prov.get("n_selected") != wanted_stories:
+        problems.append(
+            f"stories: cache has {prov.get('n_selected')}, config wants {wanted_stories}"
+        )
+
+    if problems:
+        raise ValueError(
+            f"cached '{split}' split does not match the config:\n  - "
+            + "\n  - ".join(problems)
+            + f"\nRe-run: python -m story_moe.data prepare --config <cfg> "
+              f"--cache-dir {cfg.data.cache_dir}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 3. Batching (torch)
 # ---------------------------------------------------------------------------
 
 
 class Batcher:
-    """Yields (inputs, targets) of shape [B, T], both int64, from cached blocks."""
+    """Yields (inputs, targets) of shape [B, T], both int64, from cached blocks.
+
+    Sampling is WITHOUT replacement: a shuffled permutation is consumed in order
+    and reshuffled when exhausted. This matters for honesty about coverage.
+    Drawing n times with replacement from n blocks touches only 1 - (1-1/n)^n
+    ~= 63% of them, so a "one pass" budget under `torch.randint` would leave a
+    third of the data unseen while showing others twice. With a permutation,
+    "0.98 passes" means 98% of the blocks, each exactly once.
+
+    `epochs_seen()` reports the true fractional position in the data.
+    """
 
     def __init__(self, blocks: np.ndarray, batch_size: int, seed: int = 0, shuffle: bool = True):
         import torch
@@ -213,15 +272,61 @@ class Batcher:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.generator = torch.Generator().manual_seed(seed)
+        self.epoch = 0
+        self.cursor = 0
+        self._perm = self._new_permutation()
 
-    def random_batch(self, device: str = "cpu"):
+    def _new_permutation(self):
         torch = self.torch
-        idx = torch.randint(
-            0, self.blocks.shape[0], (self.batch_size,), generator=self.generator
-        )
+        n = self.blocks.shape[0]
+        if self.shuffle:
+            return torch.randperm(n, generator=self.generator)
+        return torch.arange(n)
+
+    def next_batch(self, device: str = "cpu"):
+        """The next batch_size blocks in permutation order, wrapping at epoch end."""
+        torch = self.torch
+        taken = []
+        remaining = self.batch_size
+        while remaining > 0:
+            available = len(self._perm) - self.cursor
+            if available == 0:
+                self.epoch += 1
+                self._perm = self._new_permutation()
+                self.cursor = 0
+                continue
+            take = min(remaining, available)
+            taken.append(self._perm[self.cursor : self.cursor + take])
+            self.cursor += take
+            remaining -= take
+
+        idx = torch.cat(taken).numpy()
         # int64 first: uint16 is not a torch dtype.
-        window = torch.from_numpy(self.blocks[idx.numpy()].astype(np.int64))
+        window = torch.from_numpy(self.blocks[idx].astype(np.int64))
         return window[:, :-1].to(device), window[:, 1:].to(device)
+
+    def epochs_seen(self) -> float:
+        return self.epoch + self.cursor / max(1, len(self._perm))
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "generator": self.generator.get_state(),
+            "perm": self._perm,
+            "cursor": self.cursor,
+            "epoch": self.epoch,
+            "n_blocks": int(self.blocks.shape[0]),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state.get("n_blocks") not in (None, int(self.blocks.shape[0])):
+            raise ValueError(
+                f"checkpoint sampler covered {state['n_blocks']} blocks but this "
+                f"cache has {self.blocks.shape[0]}; the data changed under the run"
+            )
+        self.generator.set_state(state["generator"].cpu())
+        self._perm = state["perm"].cpu()
+        self.cursor = int(state["cursor"])
+        self.epoch = int(state["epoch"])
 
     def sequential_batches(self, device: str = "cpu"):
         """Every block exactly once, in order. Used for validation."""
