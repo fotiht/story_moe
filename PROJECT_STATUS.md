@@ -4,20 +4,46 @@ Updated: 2026-09-14
 
 ## Current milestone
 
-**Days 1–4 verified. A100 probe measured. Reliability fixes applied (unverified).
-Day 5 (MoE run) is next.**
+**Days 1–4 verified. Reliability fixes verified, including on GPU. First real
+training result measured. Day 5 (the 512-tier runs) is next.**
 
-### Reliability fixes from external review — WRITTEN, NEED `pytest -q`
+### Verified on the A100 (torch 2.11.0+cu128, bf16)
+
+`pytest -q` -> **77 passed** (Windows, torch 2.14.0).
+
+**GPU resume smoke: PASS**, step 3 -> 4. Checkpoint keys
+`['batcher', 'best_val_nll', 'config', 'epochs_seen', 'model', 'optimizer',
+'processed_tokens', 'rng', 'scaler', 'step', 'tokenizer']`. This is the test the
+CPU run structurally could not perform, and it is what makes a long Colab run
+survivable.
+
+**First real training result** — debug tier, 244 updates, 999,424 processed
+tokens over 1,000 stories (4.43 passes, so memorization-flavoured):
+
+```
+step   0/244  lm 10.8170
+step 243/244  lm  5.4466
+  validation  mean_nll 5.5436  ppl 255.59  over 43,392 scored tokens
+```
+
+Perplexity 255.6 against a uniform predictor's 50,257. Marginal throughput over
+the last 40 updates: ~54,900 tok/s, matching the earlier probe within 2%.
+
+**`results/*.json` history**: verified working — a controlled 3-update run with
+the file deleted first produced `history entries: 3`. An earlier check reported
+0 on a file that could not be traced to a specific run; unexplained, not
+reproduced, and not blocking. Re-check if it recurs.
+
+### Reliability fixes from external review — APPLIED AND VERIFIED
 
 Three real bugs, all of which produce plausible runs rather than crashes:
 
-1. **GPU resume was broken.** `torch.load(..., map_location=device)` moved the
+1. **GPU resume was broken.** (Now verified fixed on an A100.) `torch.load(..., map_location=device)` moved the
    saved RNG byte tensors onto the GPU, and `torch.set_rng_state` requires a CPU
    byte tensor. The CPU resume-smoke test could not catch this because
    map_location was "cpu" there. Now always loaded on CPU (`load_state_dict`
    copies into the model's on-device tensors, and the optimizer moves its own
    state), with a defensive `.cpu()` on every RNG tensor.
-   **Still needs a real GPU resume smoke test — see the notebook.**
 2. **No cache/config agreement check.** Pointing a 512-token config at the
    128-token cache ran fine and reported 4x the true processed tokens.
    `check_cache_matches_config` now validates block size, stride, tokenizer
@@ -145,17 +171,17 @@ expected: the router is an additional thing to learn.
 
 ## Next action
 
-Day 5: in Colab (notebook section 7), prepare the 512-token cache, then run
-`train_dense.yaml` and `train_moe.yaml` on the same GPU, precision and budget.
-Before committing to the full 1,220 updates, do a ~50-update run of each and
-compare tokens/s — open item 2 below.
+Day 5, in Colab. Prepare the 512-token cache once (~90k stories, a few minutes,
+cached to Drive), then run 30-update probes of `train_dense.yaml` and
+`train_moe.yaml` before committing to the full 1,220 updates. Two things to read
+off the probes: the dense/MoE tok/s ratio (open item 2), and the MoE's
+`routing assign [...]` line, which is the first real look at expert utilization.
 
-Per-layer routing statistics already exist (`collect_stats=True` →
-`ModelOutput.router_stats`); Day 5 wires them into the training log and the
-results JSON so expert usage can be inspected over an aggregate of batches
-rather than one noisy one.
+Then the full runs, Day 6 (KV cache) and Day 7 (evaluation, benchmarks, README).
 
-Then Day 6 (KV cache) and Day 7 (evaluation, benchmarks, README).
+Known annoyance: `device_commit_files` has silently failed to write three times
+in this session (reported success, file unchanged). Always read the file back
+after committing something that matters.
 
 ## Decisions log
 
