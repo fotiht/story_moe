@@ -4,7 +4,8 @@ Updated: 2026-09-14
 
 ## Current milestone
 
-**Days 1–2 complete and verified. Day 3 written, not yet run.**
+**Days 1–3 complete and verified on CPU. Day 4 (sparse MoE) is next.**
+No GPU run yet — the Colab throughput probe is the gating measurement.
 
 ## Day 1 — PASSED
 
@@ -37,14 +38,39 @@ step-0 loss 10.7838 vs ln(V) = 10.825, off by 0.041      verdict: PASS
 embedding **plus the 32,768 temporary learned position table** (256×128), which
 Day 3 deletes — expect `embedding = 6,432,896` and `total = 6,827,392` now.
 
-## Day 3 — WRITTEN, UNVERIFIED
+## Day 3 — PASSED (CPU)
 
-Still unrunnable in the cloud session (egress 403s pypi.org,
-files.pythonhosted.org, download.pytorch.org, huggingface.co; the Linux
-workspace on the Windows machine still fails to start). Syntax and config
-arithmetic are checked; nothing touching torch has been executed.
+`pytest -q` → 40 passed in 10.49s.
 
-New/changed:
+```
+parameters : total=6,827,392  embedding=6,432,896 (94.2%)  body=394,496
+```
+
+The learned position table is gone: embedding dropped from 6,465,664 to
+6,432,896 = 50,257 x 128 exactly, and RoPE added no parameters.
+
+`resume-smoke` → **PASS**, step 3 -> 4. The checkpoint carried
+`['batcher_generator', 'best_val_nll', 'config', 'model', 'optimizer',
+'processed_tokens', 'rng', 'scaler', 'step', 'tokenizer']`.
+
+20-update CPU run:
+
+```
+step  0/20  lm 10.8206  lr 1.50e-05  gn 1.52   2634 tok/s
+step 10/20  lm 10.4766  lr 1.65e-04  gn 1.41   2477 tok/s
+step 19/20  lm 10.0686  lr 3.00e-04  gn 1.39   2192 tok/s
+  validation  mean_nll 10.0315  ppl 22730.92  over 43,392 scored tokens
+```
+
+Loss decreases from ln(V) = 10.825; perplexity 22,731 against a uniform-predictor
+50,257. That is a wiring result, not a model result — 81,920 tokens is nothing.
+CPU throughput ~2,200-2,600 tok/s sets the floor the GPU must beat.
+
+The "warmup is 667% of the run" warnings on the smoke tests are the guard working
+as intended: `warmup_steps: 20` against a 3-update probe. Ignore it on probes;
+heed it on real runs.
+
+Implementation notes:
 
 - **`rope.py`** — `rope_tables(d_head, max_seq_len, base)` precomputes cos/sin
   in float32, `[max_seq_len, d_head/2]`. `apply_rope(x, cos, sin, offset)`
@@ -71,21 +97,14 @@ New/changed:
 
 ## Next action
 
-```bash
-pytest -q
-python -m story_moe.train resume-smoke --config configs/debug_dense.yaml --device cpu
-python -m story_moe.train train --config configs/debug_dense.yaml --device cpu --max-updates 20
-```
+Run the Colab throughput probe (`notebooks/story_moe_colab.ipynb`, cell 6). Its
+`tok/s` figure decides open items 1 and 2 below, and nothing after Day 4 should
+be launched until both are settled.
 
-Expect ~41 tests. `resume-smoke` should print `step 3 -> 4` and PASS.
-The 20-update run should show `lm_loss` starting near 10.8 and falling, plus a
-`tokens/s` figure — **that throughput number is what decides the real budget**.
-
-Run the same throughput probe on Colab before committing to anything:
-
-```bash
-python -m story_moe.train train --config configs/debug_dense.yaml --max-updates 50
-```
+Day 4 then builds `moe.py`: four experts, a Top-2 softmax router with
+renormalized selected weights, gather/MLP/scatter dispatch, and a dense
+all-experts oracle used only in tests. The gate is output and gradient agreement
+with that oracle, plus empty-expert handling and exactly 2N assignments.
 
 ## Decisions log
 
