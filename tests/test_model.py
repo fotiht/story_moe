@@ -131,9 +131,17 @@ def test_tied_weights_counted_once():
     assert untied["total"] - counts["total"] == VOCAB * cfg.model.d_model
 
 
-def test_moe_config_is_rejected_until_day_4():
-    with pytest.raises(NotImplementedError):
-        StoryLM(tiny_cfg(use_moe=True, n_experts=4, top_k=2))
+def test_moe_and_dense_share_everything_but_the_feedforward():
+    """Only the feed-forward slot may differ; see tests/test_moe.py for the rest."""
+    dense = StoryLM(tiny_cfg())
+    sparse = StoryLM(tiny_cfg(use_moe=True, n_experts=4, top_k=2, expert_width=48))
+
+    dense_names = {n.split(".feed_forward")[0] for n, _ in dense.named_parameters()}
+    sparse_names = {n.split(".feed_forward")[0] for n, _ in sparse.named_parameters()}
+    assert dense_names == sparse_names
+
+    assert not dense.blocks[0].use_moe and sparse.blocks[0].use_moe
+    assert count_parameters(dense)["embedding"] == count_parameters(sparse)["embedding"]
 
 
 # --- the overfit gate ------------------------------------------------------

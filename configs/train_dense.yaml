@@ -1,0 +1,52 @@
+# Main experiment: dense baseline, 6 layers / d_model 384.
+#
+# Chosen over the debug tier from the A100 probe (~55,800 tok/s at the debug
+# tier). Two reasons the debug tier cannot carry the headline comparison:
+#   - parameters: 6.83M dense vs 7.09M MoE, a 3.8% difference
+#   - compute: 94% of forward FLOPs are the embedding/output projection, so the
+#     feed-forward change barely moves either quality or throughput
+# At this tier the split is 41.7M vs 60.6M parameters and 46% embedding share.
+#
+# train_moe.yaml must differ from this file ONLY in the feed-forward fields.
+name: train_dense
+
+model:
+  n_layers: 6
+  d_model: 384
+  n_heads: 6
+  d_head: 64
+  max_seq_len: 512
+  use_moe: false
+  dense_width: 4096      # 2 * expert_width: approximate active-MLP compute match
+  rope_base: 10000.0
+  dropout: 0.0
+  tie_weights: true
+  bias: false
+
+data:
+  dataset: roneneldan/TinyStories
+  tokenizer: gpt2
+  # ~226 tokens/story measured, so 90k stories ~= 20.3M unique tokens, which
+  # makes the 20M-token budget below very close to a single pass.
+  train_stories: 90000
+  val_stories: 2000
+  seed: 1234
+  block_size: 512
+  stride: null
+  cache_dir: data/cache_512   # NOT the debug cache: different block size
+
+train:
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 60           # 20M/16384 = 1221 updates, so ~5%
+  microbatch_size: 8
+  accum_steps: 4             # effective batch 32 blocks = 16,384 tokens/update
+  max_tokens: 20000000
+  eval_every: 200
+  ckpt_every: 200
+  out_dir: checkpoints/train_dense
+  device: cuda
+  precision: bf16            # A100 supports bf16; confirmed by the notebook probe
+  require_gpu_name: A100     # refuse to run on a reassigned Colab GPU

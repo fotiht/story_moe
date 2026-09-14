@@ -1,0 +1,49 @@
+# Main experiment: Top-2 MoE, 6 layers / d_model 384.
+#
+# Identical to train_dense.yaml except the feed-forward sublayer. Diff the two
+# files before every comparison run; tests/test_config.py enforces it.
+name: train_moe
+
+model:
+  n_layers: 6
+  d_model: 384
+  n_heads: 6
+  d_head: 64
+  max_seq_len: 512
+  use_moe: true
+  n_experts: 4
+  top_k: 2
+  expert_width: 2048     # dense_width in the baseline is 2 * this
+  aux_loss_weight: 0.01
+  rope_base: 10000.0
+  dropout: 0.0
+  tie_weights: true
+  bias: false
+
+data:
+  dataset: roneneldan/TinyStories
+  tokenizer: gpt2
+  # ~226 tokens/story measured, so 90k stories ~= 20.3M unique tokens, which
+  # makes the 20M-token budget below very close to a single pass.
+  train_stories: 90000
+  val_stories: 2000
+  seed: 1234
+  block_size: 512
+  stride: null
+  cache_dir: data/cache_512   # NOT the debug cache: different block size
+
+train:
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 60           # 20M/16384 = 1221 updates, so ~5%
+  microbatch_size: 8
+  accum_steps: 4             # effective batch 32 blocks = 16,384 tokens/update
+  max_tokens: 20000000
+  eval_every: 200
+  ckpt_every: 200
+  out_dir: checkpoints/train_moe
+  device: cuda
+  precision: bf16            # A100 supports bf16; confirmed by the notebook probe
+  require_gpu_name: A100     # refuse to run on a reassigned Colab GPU

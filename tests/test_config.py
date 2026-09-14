@@ -17,7 +17,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 def test_debug_configs_load_and_validate():
-    for name in ("debug_dense.yaml", "debug_moe.yaml"):
+    for name in ("debug_dense.yaml", "debug_moe.yaml", "train_dense.yaml", "train_moe.yaml"):
         cfg = load_config(CONFIG_DIR / name)
         assert cfg.model.d_model == cfg.model.n_heads * cfg.model.d_head
         assert cfg.model.d_head % 2 == 0
@@ -58,9 +58,10 @@ def test_rejects_block_size_above_context():
         cfg.validate()
 
 
-def test_dense_and_moe_configs_differ_only_in_feedforward():
-    dense = yaml.safe_load((CONFIG_DIR / "debug_dense.yaml").read_text(encoding="utf-8"))
-    moe = yaml.safe_load((CONFIG_DIR / "debug_moe.yaml").read_text(encoding="utf-8"))
+@pytest.mark.parametrize("pair", [("debug_dense", "debug_moe"), ("train_dense", "train_moe")])
+def test_dense_and_moe_configs_differ_only_in_feedforward(pair):
+    dense = yaml.safe_load((CONFIG_DIR / f"{pair[0]}.yaml").read_text(encoding="utf-8"))
+    moe = yaml.safe_load((CONFIG_DIR / f"{pair[1]}.yaml").read_text(encoding="utf-8"))
 
     allowed = {"use_moe", "n_experts", "top_k", "expert_width", "dense_width", "aux_loss_weight"}
     keys = set(dense["model"]) | set(moe["model"])

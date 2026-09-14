@@ -1,8 +1,11 @@
 """Dense MLP, pre-norm decoder block, and the language model.
 
-DAY 3 SCOPE. Attention, the loss, and RoPE. The temporary learned positional
-embedding from Day 2 has been DELETED, not merely disabled -- the final
-architecture must not carry both. MoE and the KV cache are not here yet.
+DAY 4 SCOPE. Attention, the loss, RoPE, and the sparse Top-k MoE feed-forward.
+The temporary learned positional embedding from Day 2 was DELETED, not disabled.
+The KV cache is not here yet.
+
+Dense and MoE share every line of this file except which module fills the
+feed-forward slot, which is what makes the comparison controlled.
 
 Parameter accounting: with the GPT-2 vocabulary (50,257) and a small d_model the
 tied embedding dominates the total, so count_parameters() reports embedding and
@@ -21,6 +24,7 @@ import torch.nn.functional as F
 
 from .attention import CausalSelfAttention
 from .config import Config
+from .moe import RouterStats, SparseMoE
 from .rope import rope_tables
 
 
@@ -38,8 +42,8 @@ class ModelOutput:
     lm_loss: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
     total_loss: torch.Tensor | None = None
-    past_key_values: list | None = None      # Day 6
-    router_stats: list | None = None         # Day 5
+    past_key_values: list | None = None            # Day 6
+    router_stats: list[RouterStats] | None = None  # detached, opt-in
 
 
 class DenseMLP(nn.Module):
@@ -64,8 +68,12 @@ class DecoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(m.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.norm2 = nn.LayerNorm(m.d_model)
-        # Day 4 swaps this for the Top-k MoE when cfg.model.use_moe is set.
-        self.feed_forward = DenseMLP(m.d_model, m.dense_width, m.dropout, m.bias)
+        # The ONLY architectural difference between the two models.
+        self.use_moe = m.use_moe
+        self.feed_forward = (
+            SparseMoE(cfg) if m.use_moe
+            else DenseMLP(m.d_model, m.dense_width, m.dropout, m.bias)
+        )
 
     def forward(
         self,
@@ -73,10 +81,16 @@ class DecoderBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         past_len: int = 0,
-    ) -> torch.Tensor:
+        need_aux: bool = True,
+        collect_stats: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, RouterStats | None]:
         x = x + self.attn(self.norm1(x), cos, sin, past_len=past_len)
-        x = x + self.feed_forward(self.norm2(x))
-        return x
+        h = self.norm2(x)
+        if self.use_moe:
+            ff, aux, stats = self.feed_forward(h, need_aux=need_aux, collect_stats=collect_stats)
+        else:
+            ff, aux, stats = self.feed_forward(h), None, None
+        return x + ff, aux, stats
 
 
 class StoryLM(nn.Module):
@@ -88,9 +102,6 @@ class StoryLM(nn.Module):
                 "cfg.model.vocab_size is unset. Resolve it from the tokenizer "
                 "(len(tokenizer)) before building the model."
             )
-        if m.use_moe:
-            raise NotImplementedError("MoE arrives on Day 4; use a dense config for now")
-
         self.cfg = cfg
         self.token_emb = nn.Embedding(m.vocab_size, m.d_model)
         self.drop = nn.Dropout(m.dropout)
@@ -130,6 +141,7 @@ class StoryLM(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         logits_to_keep: int | None = None,
+        collect_stats: bool = False,
     ) -> ModelOutput:
         """[B, T] -> ModelOutput.
 
@@ -149,8 +161,23 @@ class StoryLM(nn.Module):
 
         x = self.drop(self.token_emb(input_ids))
 
+        # The balancing reduction runs only when it can actually be optimized.
+        # Inference and the cache benchmark skip it, so no diagnostic work
+        # separates those paths from each other.
+        need_aux = targets is not None
+        aux_terms: list[torch.Tensor] = []
+        stats: list[RouterStats] = []
+
         for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin, past_len=0)
+            x, aux, stat = block(
+                x, self.rope_cos, self.rope_sin, past_len=0,
+                need_aux=need_aux, collect_stats=collect_stats,
+            )
+            if aux is not None:
+                aux_terms.append(aux)
+            if stat is not None:
+                stats.append(stat)
+
         x = self.final_norm(x)
 
         if logits_to_keep:
@@ -165,12 +192,23 @@ class StoryLM(nn.Module):
                 logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
             )
 
-        # Dense model: the balancing term is exactly zero, and total == language.
-        aux_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        total_loss = None if lm_loss is None else lm_loss + 0.0 * aux_loss
+        # Averaged across MoE layers. A dense model contributes no terms, so its
+        # auxiliary loss is exactly zero and total_loss == lm_loss.
+        if aux_terms:
+            aux_loss = torch.stack(aux_terms).mean()
+        else:
+            aux_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+
+        total_loss = None
+        if lm_loss is not None:
+            total_loss = lm_loss + self.cfg.model.aux_loss_weight * aux_loss
 
         return ModelOutput(
-            logits=logits, lm_loss=lm_loss, aux_loss=aux_loss, total_loss=total_loss
+            logits=logits,
+            lm_loss=lm_loss,
+            aux_loss=aux_loss,
+            total_loss=total_loss,
+            router_stats=stats or None,
         )
 
 

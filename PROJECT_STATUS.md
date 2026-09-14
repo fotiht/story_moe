@@ -4,138 +4,135 @@ Updated: 2026-09-14
 
 ## Current milestone
 
-**Days 1–3 complete and verified on CPU. Day 4 (sparse MoE) is next.**
-No GPU run yet — the Colab throughput probe is the gating measurement.
+**Days 1–3 verified. A100 probe measured. Day 4 (sparse MoE) written, not yet run.**
 
-## Day 1 — PASSED
+## Working constraint
 
-Windows, Python 3.13, torch 2.14.0, transformers 5.17.0, datasets 5.0.1,
-tokenizer `gpt2` (len 50257, EOS 50256).
+The Claude session cannot run PyTorch: egress returns 403 for pypi.org,
+files.pythonhosted.org, download.pytorch.org and huggingface.co, and the Linux
+workspace on the Windows machine fails to start. Loop: Claude writes code and
+commits it to the folder → push → run locally or in Colab → paste output back.
+Pure-Python logic is verified in the sandbox; anything touching torch is
+unverified until run.
 
-| Split | Blocks | Unique stream tokens | Discarded | Scored targets |
+## Verified results
+
+**Day 1** — cache for 1,000/200 stories, block_size 128, stride 128, gpt2
+(len 50257, EOS 50256):
+
+| Split | Blocks | Unique tokens | Discarded | Scored targets |
 | --- | --- | --- | --- | --- |
 | train | 1,763 | 225,790 | 125 | 225,664 |
 | validation | 339 | 43,427 | 34 | 43,392 |
 
-`1 + (225790 - 129) // 128 = 1763` windows covering `1762*128 + 129 = 225665`
-tokens, leaving exactly 125 discarded. ~226 tokens per story.
+~226 tokens per story.
 
-## Day 2 — PASSED
+**Day 2** — overfit collapsed 10.7838 → 0.0018 at 100% next-token accuracy;
+step-0 loss within 0.041 of ln(50257) = 10.825.
 
-`pytest -q` → 29 passed. Overfit on 2 fixed blocks:
+**Day 3** — 40 tests pass. `resume-smoke` PASS (step 3 → 4). Parameters
+`total=6,827,392 embedding=6,432,896 (94.2%) body=394,496`; body reproduces
+exactly as 131,072 attention + 262,144 MLP + 1,280 LayerNorm.
 
-```
-parameters : total=6,860,160  embedding=6,465,664 (94.2%)  body=394,496
-step   0   lm_loss 10.7838   next-token acc   1.56%
-step  25   lm_loss  4.8486   next-token acc  92.58%
-step  50   lm_loss  1.2257   next-token acc  99.61%
-step 200   lm_loss  0.0018   next-token acc 100.00%
-step-0 loss 10.7838 vs ln(V) = 10.825, off by 0.041      verdict: PASS
-```
-
-`body = 394,496` reproduces exactly: 131,072 attention (4·128²·2) + 262,144 MLP
-(2·128·512·2) + 1,280 LayerNorm. The 6,465,664 embedding was 6,432,896 token
-embedding **plus the 32,768 temporary learned position table** (256×128), which
-Day 3 deletes — expect `embedding = 6,432,896` and `total = 6,827,392` now.
-
-## Day 3 — PASSED (CPU)
-
-`pytest -q` → 40 passed in 10.49s.
+**A100 probe** — 50 updates, debug tier, bf16, `NVIDIA A100-SXM4-40GB`,
+torch 2.11.0+cu128:
 
 ```
-parameters : total=6,827,392  embedding=6,432,896 (94.2%)  body=394,496
+step  0/50  lm 10.8205   4,537 tok/s (cumulative)
+step 49/50  lm  8.9928  45,546 tok/s (cumulative)
+  validation  mean_nll 9.0150  ppl 8225.16  over 43,392 scored tokens
 ```
 
-The learned position table is gone: embedding dropped from 6,465,664 to
-6,432,896 = 50,257 x 128 exactly, and RoPE added no parameters.
+Marginal rate between logged steps: 55,764 / 55,966 / 55,978 / 55,483 / 56,075
+tok/s — **flat at ~55,800**, within 1%. CPU was ~2,200–2,600, so the A100 is
+roughly 22x. At 55,800 tok/s, 20M tokens is about 6 minutes at the debug tier.
 
-`resume-smoke` → **PASS**, step 3 -> 4. The checkpoint carried
-`['batcher_generator', 'best_val_nll', 'config', 'model', 'optimizer',
-'processed_tokens', 'rng', 'scaler', 'step', 'tokenizer']`.
+## Decisions from the probe
 
-20-update CPU run:
+**Tier: the 6-layer / d_model 384 configuration carries the comparison.** At the
+debug tier 94% of forward FLOPs are the embedding and output projection, so the
+feed-forward change barely moves quality or throughput, and the models differ by
+3.8% in parameters. At the larger tier it is 41.72M vs 60.60M total (bodies
+22.42M vs 41.30M) and a 46% embedding share. New: `configs/train_dense.yaml`,
+`configs/train_moe.yaml`.
 
-```
-step  0/20  lm 10.8206  lr 1.50e-05  gn 1.52   2634 tok/s
-step 10/20  lm 10.4766  lr 1.65e-04  gn 1.41   2477 tok/s
-step 19/20  lm 10.0686  lr 3.00e-04  gn 1.39   2192 tok/s
-  validation  mean_nll 10.0315  ppl 22730.92  over 43,392 scored tokens
-```
+**Budget: 20M processed tokens over 90,000 stories = 0.98 passes.** The spec's
+1–5M suggestion is 18–90 seconds on this GPU; there is no reason to be that
+small. 90k stories x 226 tokens ≈ 20.3M unique, so the run is close to a single
+epoch rather than 4–22 repeats.
 
-Loss decreases from ln(V) = 10.825; perplexity 22,731 against a uniform-predictor
-50,257. That is a wiring result, not a model result — 81,920 tokens is nothing.
-CPU throughput ~2,200-2,600 tok/s sets the floor the GPU must beat.
+Experiment settings: block_size 512, microbatch 8, accum 4 → 16,384 tokens per
+update, 1,220 updates, warmup 60 (5%), bf16, `require_gpu_name: A100`, cache at
+`data/cache_512` (separate from the 128-token debug cache).
 
-The "warmup is 667% of the run" warnings on the smoke tests are the guard working
-as intended: `warmup_steps: 20` against a 3-update probe. Ignore it on probes;
-heed it on real runs.
+## Day 4 — WRITTEN, UNVERIFIED
 
-Implementation notes:
+`src/story_moe/moe.py` plus `tests/test_moe.py` (24 tests).
 
-- **`rope.py`** — `rope_tables(d_head, max_seq_len, base)` precomputes cos/sin
-  in float32, `[max_seq_len, d_head/2]`. `apply_rope(x, cos, sin, offset)`
-  rotates `[B, H, T, Dh]` at absolute positions `offset .. offset+T-1`.
-  Adjacent even/odd pair convention (GPT-J style), `theta_i = base**(-2i/Dh)`.
-- **`attention.py`** — rotates Q and K, never V. Takes `past_len` and passes it
-  to both the rotation offset and the mask.
-- **`model.py`** — the learned positional embedding is **deleted**, not disabled.
-  `rope_cos`/`rope_sin` are non-persistent buffers, so they move with `.to()`
-  but do not bloat checkpoints.
-- **`evaluate.py`** — token-weighted NLL: sum over every scored target, divide
-  once, `ppl = exp(mean_nll)`. Language loss only. Restores train/eval mode.
-- **`train.py`** — full loop: AdamW with decay on matrices only, linear warmup
-  then cosine to 10%, gradient accumulation (loss divided before backward),
-  fp16 autocast with unscale-before-clip, periodic validation, atomic
-  `latest.pt` / `best.pt`, and resume that restores optimizer, scaler, RNG and
-  sampler state.
-- **`tests/test_rope.py`** — 12 tests. Two matter most: rotating a chunk at
-  offset P equals rotating the whole sequence and slicing the tail, and the
-  q·k dot product depends only on the position *difference*. Those are why a
-  key can be rotated once, cached, and stay correct.
-- **`tests/_helpers.py`** — shared tiny config; `pythonpath` now includes
-  `tests`.
+- `SparseMoE.route` — float32 softmax, `topk`, selected weights renormalized to
+  sum to 1. **Not detached**: the language loss trains the router through them.
+- Dispatch — per expert, gather its assigned rows, one MLP call, weight, and
+  `index_add` back. k*N token-expert evaluations, not E*N.
+- `balance_loss` — `f_e` over k*N assignments (detached), `P_e` the mean full
+  probability before truncation, `L = E * sum_e f_e * P_e`. **Balanced value is
+  1, not 0.**
+- `RouterStats` — assignment fractions, mean probabilities, router entropy,
+  aux loss, token count. Detached, opt-in via `collect_stats`.
+- `need_aux=False` skips the balancing reduction entirely, so no diagnostic work
+  distinguishes the cached and uncached benchmark paths later.
+- `DecoderBlock` now returns `(x, aux, stats)`; `StoryLM` averages aux across MoE
+  layers and computes `total = lm + aux_weight * aux`. Dense aux is exactly 0.
+
+The gate is `test_gradients_match_dense_oracle`: input, expert **and** router
+gradients must match a dense all-experts oracle using identical Top-2 weights.
+Routing that produces correct outputs with wrong gradients is the classic silent
+MoE failure.
 
 ## Next action
 
-Run the Colab throughput probe (`notebooks/story_moe_colab.ipynb`, cell 6). Its
-`tok/s` figure decides open items 1 and 2 below, and nothing after Day 4 should
-be launched until both are settled.
+```bash
+pytest -q                                   # expect ~64 tests
+python -m story_moe.train overfit --config configs/debug_moe.yaml --steps 200
+```
 
-Day 4 then builds `moe.py`: four experts, a Top-2 softmax router with
-renormalized selected weights, gather/MLP/scatter dispatch, and a dense
-all-experts oracle used only in tests. The gate is output and gradient agreement
-with that oracle, plus empty-expert handling and exactly 2N assignments.
+The MoE overfit should collapse like the dense one did, with `aux` sitting near
+1.0 throughout — not falling toward zero.
+
+Then, in Colab (notebook section 7): prepare the 512 cache, run
+`train_dense.yaml`, then `train_moe.yaml` on the same GPU, same precision, same
+budget.
 
 ## Decisions log
 
-- `max_seq_len` 256, not 128 — the benchmark grid needs prompt 128 + 64 replay.
-- Stride = `block_size`; windows share one boundary token, every token after the
-  first is a target exactly once.
+- `max_seq_len` 256 at the debug tier (benchmark grid needs prompt 128 + 64).
+- Stride = `block_size`; every token after the first is a target exactly once.
 - `vocab_size` resolved at runtime from `len(tokenizer)`.
 - `train.device` / `precision` / `require_gpu_name` asserted at startup.
 - `count_parameters` splits embedding from body; body is the comparison number.
-- Attention written explicitly, no SDPA, until the reference is matched.
-- `warmup_steps` lowered 100 → 20: at 4,096 tokens per update a 1M-token budget
-  is only 244 updates, so 100 would have been 41% of the run.
-- Resume is documented as "state reloads and training continues", never as
-  bitwise-identical resumed training.
+- Attention explicit, no SDPA, until the reference is matched.
+- `warmup_steps` 100 → 20 at the debug tier, 60 at the experiment tier (~5%).
+- Resume is "state reloads and training continues", never bitwise-identical.
+- Colab runs torch 2.11.0+cu128, Windows runs 2.14.0 — every quoted number must
+  say which.
 
 ## Open items
 
-1. **Subset size for the real run.** 1,000 stories = 225,790 unique tokens, so
-   the default 1M-token budget is **4.4 passes** over the same text (the trainer
-   now prints this and warns above 2.0). For a single pass at 5M tokens the
-   subset needs roughly 22,000 stories. Decide before launching the baseline.
-2. **Debug tier vs 6-layer/384 tier for the headline comparison.** Decide from
-   the Colab throughput probe above.
-3. **Measure MoE throughput before freezing the dense token budget** — a
-   ~200-step smoke run on Day 4, before the dense run is treated as final.
-4. Repo is inside OneDrive; `.gitignore` keeps `data/` and `checkpoints/` out of
-   Git but not out of sync. Checkpoints will be ~80 MB each at the debug tier
-   (6.8M params × 4 bytes × 3 for weights + Adam moments), so `best.pt` plus
-   `latest.pt` per run is real sync traffic once training starts.
+1. **Microbatch is likely far too small for an A100.** The probe pushed 4 x 128 =
+   512 tokens per forward; the bf16 logits tensor was 49 MiB against 40 GB of
+   memory. Raising microbatch and lowering accum by the same factor leaves the
+   effective batch and the optimization trajectory identical but should improve
+   throughput substantially. The experiment config uses 8 x 4; worth a quick
+   sweep before the real runs.
+2. **Measure MoE throughput before treating the dense run as final.** Gather/
+   scatter dispatch can be slower per token; if it is much slower, the matched
+   token budget may not fit the wall clock.
+3. Repo is inside OneDrive; `.gitignore` keeps `data/` and `checkpoints/` out of
+   Git but not out of sync. Experiment checkpoints will be ~500 MB each at
+   41.7M/60.6M parameters with Adam moments — these go to Drive via `--out-dir`,
+   not into the repo folder.
 
 ## Resolved
 
-- Initial-loss assertion — added and passing (10.7838 vs ln(V) = 10.825).
-- Day 2's `float(tensor)` autograd warnings — replaced with `.item()`.
+- Subset size and tier — settled by the probe, above.
+- Initial-loss assertion — passing.
+- `float(tensor)` autograd warnings — replaced with `.item()`.

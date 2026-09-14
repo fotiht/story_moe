@@ -4,11 +4,11 @@ A next-token language model trained from random initialization on a fixed
 TinyStories subset. It continues short story prompts; it is not an
 instruction-tuned assistant.
 
-**Status: Day 3 of 7.** Data pipeline, causal attention, the dense decoder block
-and the next-token loss are verified. RoPE, validation, checkpoint/resume and
-the training loop are written. No MoE, no KV cache, and no completed training
-runs yet. Every results table below reads NOT MEASURED and will stay that way
-until a run actually produces the number.
+**Status: Day 4 of 7.** Data pipeline, causal attention, RoPE, the loss,
+validation and checkpoint/resume are verified. The sparse Top-2 MoE is written
+and awaiting its gate. No KV cache and no completed training runs yet. Every
+results table below reads NOT MEASURED and will stay that way until a run
+actually produces the number.
 
 ## Setup
 
@@ -58,6 +58,24 @@ Overrides that do not need a config edit: `--device`, `--precision`,
 ## Running on Colab
 
 `notebooks/story_moe_colab.ipynb` sets up and launches; it contains no model code.
+
+Code reaches Colab through GitHub. One-time setup, from this folder on Windows:
+
+```bash
+git init
+git add .
+git status                 # confirm .venv/, data/ and checkpoints/ are NOT listed
+git commit -m "story_moe: days 1-3"
+gh repo create story_moe --private --source=. --push
+# without the gh CLI: create an empty PRIVATE repo on github.com, then
+#   git remote add origin https://github.com/<you>/story_moe.git
+#   git branch -M main && git push -u origin main
+```
+
+After that: `git add -A && git commit -m "..." && git push` on Windows, and the
+notebook's clone/pull cell picks the change up in Colab. Put the repo URL in that
+cell once. Keep the repo private — nothing here is secret, but an `HF_TOKEN` or a
+stray checkpoint is much easier to leak than to un-leak.
 
 Three things that matter there and nowhere else:
 
@@ -113,7 +131,20 @@ list, its hash, the split size and the tokenizer fingerprint are all written to
 Pre-norm decoder blocks, multi-head causal self-attention, RoPE on queries and
 keys only, LayerNorm, GELU experts, tied input/output embeddings, bias-free
 linear projections. The feed-forward sublayer is either a dense MLP or four
-experts with Top-2 routing and a renormalized softmax gate (not yet built).
+experts with Top-2 routing and a renormalized softmax gate.
+
+The MoE computes only the experts a token selected: each expert's assigned rows
+are gathered, run through one MLP call, weighted, and scatter-added back. Over
+N tokens that is k*N token-expert evaluations, not E*N. A dense all-experts
+version exists solely as a test oracle.
+
+The balancing objective is a Top-k adaptation of the Switch loss:
+`f_e` is expert e's share of the k*N assignments, `P_e` the mean full softmax
+probability, and `L = E * sum_e f_e * P_e`. **Under uniform routing this equals
+1, not 0** — an auxiliary loss near 1 is healthy and should not be driven down.
+Gradients reach the router through `P_e` (the probabilities before top-k
+truncation) and through the renormalized selected weights, which are never
+detached. The top-k indices themselves are discrete and carry no gradient.
 
 Position comes from RoPE alone — there is no learned positional embedding table.
 Attention masking uses `j <= past_len + i` in its general form from the start, so
@@ -133,12 +164,26 @@ The debug dense row is confirmed against an instantiated model: `body = 394,496`
 | --- | --- | --- | --- | --- | --- |
 | Debug dense (2L, D=128, m=512) | 6.43M | 0.13M | 0.26M | 6.83M | 94% |
 | Debug MoE (2L, D=128, 4×m=256) | 6.43M | 0.13M | 0.52M | 7.09M | 91% |
-| Larger dense (6L, D=384, m=4096) | 19.30M | 3.54M | 18.87M | 41.71M | 46% |
-| Larger MoE (6L, D=384, 4×m=2048) | 19.30M | 3.54M | 37.75M | 60.59M | 32% |
+| **Experiment dense** (6L, D=384, m=4096) | 19.30M | 3.54M | 18.87M | **41.72M** | 46% |
+| **Experiment MoE** (6L, D=384, 4×m=2048) | 19.30M | 3.54M | 37.75M | **60.60M** | 32% |
 
-The debug tier is a plumbing demonstration. A comparison run at that size tells
-you almost nothing about MoE, because the two models differ by 3.8% in total
-parameters while differing by 67% in the body.
+The debug tier is a plumbing demonstration, and the measured A100 probe confirms
+why: 94% of its forward FLOPs are the embedding and output projection, so the
+feed-forward change moves neither quality nor throughput much, and the two
+models differ by only 3.8% in total parameters. The main experiment therefore
+runs at 6 layers / d_model 384 — `configs/train_dense.yaml` and
+`configs/train_moe.yaml`, 41.72M vs 60.60M parameters, bodies 22.42M vs 41.30M.
+
+### Measured throughput
+
+| Setup | GPU | Precision | Tokens/s |
+| --- | --- | --- | --- |
+| Debug tier, microbatch 4, T=128 | A100-SXM4-40GB | bf16 | ~55,800 (steady state) |
+| Debug tier, microbatch 4, T=128 | CPU (Windows) | fp32 | ~2,200–2,600 |
+
+Marginal rate over the last 40 updates of the probe was flat within 1%. Colab
+runs torch 2.11.0+cu128; the Windows venv runs 2.14.0 — any number quoted must
+say which produced it.
 
 ## Comparison protocol
 
