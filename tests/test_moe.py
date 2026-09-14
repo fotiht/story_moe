@@ -238,7 +238,7 @@ def test_balance_loss_exceeds_one_when_routing_collapses(moe):
     moe.router = ConstRouter(torch.tensor([9.0, 8.0, -9.0, -9.0]))
     flat = torch.randn(64, D)
     probs, topk_idx, _ = moe.route(flat)
-    assert float(moe.balance_loss(probs, topk_idx)) > 1.0
+    assert moe.balance_loss(probs, topk_idx).item() > 1.0
 
 
 def test_balance_loss_gradient_flows_through_probabilities_only(moe):
