@@ -262,13 +262,12 @@ unverified until `pytest -q` runs again.
 
 ## Working constraint
 
-The Claude session cannot run PyTorch: egress returns 403 for pypi.org,
-files.pythonhosted.org, download.pytorch.org and huggingface.co, and the Linux
-workspace on the Windows machine fails to start. Loop: Claude writes code and
-commits it to the folder, the user pushes, the code runs locally or in Colab,
-and the output comes back here.
-Pure-Python logic is verified in the sandbox; anything touching torch is
-unverified until run.
+Code was written in an environment that could not run PyTorch, so nothing was
+verified where it was written. Every change had to be run on the Windows machine
+or in Colab before it could be believed. Two habits came out of that and are
+worth keeping regardless: `data.py` is layered so its packing logic imports
+without torch and can be tested anywhere, and any claim about behaviour in this
+file is labelled by the machine and precision that produced it.
 
 ## Verified results
 
@@ -398,10 +397,6 @@ Optional work, if the project continues past the plan:
   overhead crossover properly instead of bracketing it between two points.
 - SDPA in place of the explicit attention, now that the explicit version is the
   verified reference to match against.
-
-Known annoyance: `device_commit_files` has silently failed to write three times
-in this session (reported success, file unchanged). Always read the file back
-after committing something that matters.
 
 ## Decisions log
 

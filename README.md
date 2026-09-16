@@ -68,23 +68,17 @@ Overrides that do not need a config edit: `--device`, `--precision`,
 
 `notebooks/story_moe_colab.ipynb` sets up and launches; it contains no model code.
 
-Code reaches Colab through GitHub. One-time setup, from this folder on Windows:
+Code reaches Colab through GitHub:
 
 ```bash
-git init
-git add .
-git status                 # confirm .venv/, data/ and checkpoints/ are NOT listed
-git commit -m "story_moe: days 1-3"
-gh repo create story_moe --private --source=. --push
-# without the gh CLI: create an empty PRIVATE repo on github.com, then
-#   git remote add origin https://github.com/<you>/story_moe.git
-#   git branch -M main && git push -u origin main
+!git clone https://github.com/fotiht/story_moe.git /content/story_moe
+!cd /content/story_moe && pip install -e . --no-deps
 ```
 
-After that: `git add -A && git commit -m "..." && git push` on Windows, and the
-notebook's clone/pull cell picks the change up in Colab. Put the repo URL in that
-cell once. Keep the repo private. Nothing here is secret, but an `HF_TOKEN` or a
-stray checkpoint is much easier to leak than to un-leak.
+The notebook's clone cell also carries a token-based path, left over from when
+this repo was private. It is unnecessary now: a public clone needs no
+credential. Skip the `GH_TOKEN` setup unless you have forked to a private repo
+of your own.
 
 Colab behaves differently from the other environments in three ways:
 
@@ -438,6 +432,18 @@ overhead floor is a property of that combination, not of KV caching.
 
 ### What the model writes
 
+Trained weights are not distributed with this repo. They are roughly 500 MB each
+with the optimizer state, and a checkpoint in Git history cannot be removed
+cleanly later. Reproducing them is cheap: the two runs below took 195 and 364
+seconds on an A100, and every setting that determines them lives in
+`configs/train_dense.yaml` and `configs/train_moe.yaml`.
+
+```bash
+python -m story_moe.data prepare --config configs/train_dense.yaml
+python -m story_moe.train train --config configs/train_dense.yaml
+python -m story_moe.train train --config configs/train_moe.yaml
+```
+
 From the trained MoE, temperature 0.8, top-k 50, seed 0, one unedited sample:
 
 ```
@@ -480,6 +486,10 @@ protocol" and not as a claim about quality.
   instead. Both are valid; a direct tensor comparison against those
   implementations will not match.
 - No target perplexity, speedup, or parameter count is promised.
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Attribution
 
