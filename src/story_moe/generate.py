@@ -80,6 +80,12 @@ def sample_next(
         logits = logits.masked_fill(logits < kth, float("-inf"))
 
     probs = F.softmax(logits, dim=-1)
+    if generator is not None and generator.device.type != probs.device.type:
+        raise ValueError(
+            f"generator is on {generator.device.type} but the logits are on "
+            f"{probs.device.type}; torch.multinomial requires them to match. "
+            f"Build it as torch.Generator(device={probs.device.type!r})."
+        )
     return torch.multinomial(probs, num_samples=1, generator=generator)
 
 
@@ -225,7 +231,9 @@ def main(argv: list[str] | None = None) -> None:
         top_k=args.top_k if args.top_k > 0 else None,
         eos_id=tok.eos_token_id,
     )
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    # The generator must live where the probabilities do, which is wherever the
+    # model is. A CPU generator with CUDA logits is a hard error in multinomial.
+    generator = torch.Generator(device=device).manual_seed(args.seed)
 
     print(f"checkpoint     : step={meta['step']} val_nll={meta['best_val_nll']}")
     print(f"decoding       : temperature={cfg.temperature} top_k={cfg.top_k} "

@@ -111,6 +111,79 @@ def peak_mib(device: str) -> float | None:
 
 
 @torch.no_grad()
+def lockstep_compare(
+    model: StoryLM,
+    prompt: torch.Tensor,
+    n_steps: int,
+    amp: Callable[[], Any],
+) -> dict[str, Any]:
+    """Step both paths on IDENTICAL tokens and compare their logits directly.
+
+    Free-running greedy decode answers "do the two paths produce the same
+    story", but it answers it badly: one differing token at step 40 makes every
+    later token differ too, so a single disagreement looks like total failure
+    and there is no way to see how big the underlying numerical difference was.
+
+    Here both paths are fed the same token every step, chosen by the cached
+    path. That isolates per-step disagreement from cumulative drift and lets the
+    question become quantitative: how far apart are the logits, and when argmax
+    does disagree, how close were the top two candidates?
+
+    A real cache bug (wrong RoPE offset, per-layer length skew) produces a large
+    logit delta at the FIRST step. Reduced-precision tie-breaking produces a
+    tiny delta that only flips argmax when the top-2 gap is smaller than it.
+    Those two stories are distinguishable, which is the point of measuring.
+    """
+    ids = prompt.clone()
+    cache = model.new_cache(max_len=prompt.size(1) + n_steps)
+    with amp():
+        out_cached = model(prompt, logits_to_keep=1, cache=cache)
+        out_uncached = model(prompt, logits_to_keep=1)
+
+    max_delta = 0.0
+    max_logit_scale = 0.0
+    disagreements = 0
+    first: dict[str, Any] | None = None
+
+    for step in range(n_steps):
+        lc = out_cached.logits[:, -1, :].float()
+        lu = out_uncached.logits[:, -1, :].float()
+
+        delta = (lc - lu).abs().max().item()
+        max_delta = max(max_delta, delta)
+        max_logit_scale = max(max_logit_scale, lu.abs().max().item())
+
+        pick_c = lc.argmax(dim=-1)
+        pick_u = lu.argmax(dim=-1)
+        if not torch.equal(pick_c, pick_u):
+            disagreements += 1
+            if first is None:
+                top2 = lu.topk(2, dim=-1).values
+                first = {
+                    "step": step,
+                    "logit_delta": delta,
+                    "top2_gap": (top2[:, 0] - top2[:, 1]).min().item(),
+                    "cached_token": int(pick_c[0].item()),
+                    "uncached_token": int(pick_u[0].item()),
+                }
+
+        nxt = pick_c.unsqueeze(1)
+        ids = torch.cat([ids, nxt], dim=1)
+        with amp():
+            out_cached = model(nxt, logits_to_keep=1, cache=cache)
+            out_uncached = model(ids, logits_to_keep=1)
+
+    return {
+        "steps": n_steps,
+        "max_logit_delta": max_delta,
+        "max_logit_magnitude": max_logit_scale,
+        "relative_delta": (max_delta / max_logit_scale) if max_logit_scale else None,
+        "argmax_disagreements": disagreements,
+        "first_disagreement": first,
+    }
+
+
+@torch.no_grad()
 def benchmark_point(
     model: StoryLM,
     prompt_len: int,
@@ -141,10 +214,30 @@ def benchmark_point(
     gcfg = GenerationConfig(max_new_tokens=replay_len, temperature=0.0)
 
     # Correctness first. If these disagree the timings below are meaningless.
+    #
+    # The gate runs in fp32, not in the timing precision. The cache is a
+    # mathematical identity, so it has to be tested where the arithmetic is
+    # precise enough to test it. Greedy token equality is a DISCONTINUOUS
+    # function of the logits: under bf16, two candidates within ~1e-2 of each
+    # other can swap on a rounding difference, and one swapped token makes every
+    # later token differ. Failing the run on that would be reporting a property
+    # of bf16 as though it were a broken cache.
+    fp32 = autocast_for(device, "fp32")
+    with fp32():
+        agree_fp32 = bool(torch.equal(
+            generate(model, prompt, gcfg, use_cache=True),
+            generate(model, prompt, gcfg, use_cache=False),
+        ))
+    lockstep_fp32 = lockstep_compare(model, prompt, min(replay_len, 32), fp32)
+
+    # And the same question at the precision actually being timed, reported
+    # rather than enforced, with the logit deltas that explain the answer.
     with amp():
-        cached_ids = generate(model, prompt, gcfg, use_cache=True)
-        uncached_ids = generate(model, prompt, gcfg, use_cache=False)
-    agree = bool(torch.equal(cached_ids, uncached_ids))
+        agree_native = bool(torch.equal(
+            generate(model, prompt, gcfg, use_cache=True),
+            generate(model, prompt, gcfg, use_cache=False),
+        ))
+    lockstep_native = lockstep_compare(model, prompt, min(replay_len, 32), amp)
 
     def run_prefill() -> None:
         cache = model.new_cache(max_len=prompt_len + replay_len)
@@ -187,7 +280,10 @@ def benchmark_point(
         "prompt_tokens": prompt_len,
         "replay_tokens": replay_len,
         "batch_size": batch_size,
-        "outputs_agree": agree,
+        "outputs_agree_fp32": agree_fp32,
+        "outputs_agree_native": agree_native,
+        "lockstep_fp32": lockstep_fp32,
+        "lockstep_native": lockstep_native,
         "prefill_ms": prefill_ms,
         "cached_total_ms": cached_ms,
         "uncached_total_ms": uncached_ms,
@@ -234,7 +330,7 @@ def run_grid(
             batch_size=batch_size, warmup=warmup, trials=trials,
         )
         rows.append(row)
-        flag = "" if row["outputs_agree"] else "   <-- OUTPUTS DIFFER"
+        flag = "" if row["outputs_agree_fp32"] else "   <-- fp32 MISMATCH, CACHE IS WRONG"
         print(
             f"  prompt {prompt_len:>4}  replay {replay_len:>4}   "
             f"prefill {row['prefill_ms']:7.2f} ms   "
@@ -242,7 +338,31 @@ def run_grid(
             f"uncached {_fmt(row['uncached_ms_per_token'], 7, 3)} ms/tok   "
             f"speedup {_fmt(row['speedup'], 5, 2)}x{flag}"
         )
+        _print_precision_note(row)
     return rows
+
+
+def _print_precision_note(row: dict[str, Any]) -> None:
+    """Show why the timed precision disagreed, when it did."""
+    if row["outputs_agree_native"]:
+        return
+    ls = row["lockstep_native"]
+    first = ls["first_disagreement"]
+    detail = ""
+    if first:
+        detail = (
+            f", first at step {first['step']} where the top-2 gap was "
+            f"{first['top2_gap']:.4f} against a logit delta of "
+            f"{first['logit_delta']:.4f}"
+        )
+    print(
+        f"      note: same tokens in fp32, different tokens at the timed "
+        f"precision. Lockstep max logit delta "
+        f"{ls['max_logit_delta']:.5f} on logits of magnitude up to "
+        f"{ls['max_logit_magnitude']:.2f} "
+        f"({ls['argmax_disagreements']}/{ls['steps']} steps flipped argmax"
+        f"{detail})."
+    )
 
 
 def _fmt(value: float | None, width: int, places: int) -> str:
@@ -313,14 +433,28 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=args.batch_size, warmup=args.warmup, trials=args.trials,
     )
 
-    disagreements = [r for r in rows if not r["outputs_agree"]]
-    if disagreements:
+    broken = [r for r in rows if not r["outputs_agree_fp32"]]
+    if broken:
+        worst = max(r["lockstep_fp32"]["max_logit_delta"] for r in broken)
         raise SystemExit(
-            f"\nFAIL: {len(disagreements)} grid point(s) produced different tokens "
-            "with and without the cache. The timings are not comparable; fix the "
-            "cache before quoting any speedup."
+            f"\nFAIL: {len(broken)} grid point(s) produced different tokens with "
+            f"and without the cache IN FP32, where the two paths are the same "
+            f"computation. Largest lockstep logit delta {worst:.6f}. The cache is "
+            "wrong; do not quote any speedup."
         )
-    print("\nall grid points produced identical tokens with and without the cache")
+    print("\nfp32 gate: all grid points produced identical tokens with and without "
+          "the cache")
+
+    flipped = [r for r in rows if not r["outputs_agree_native"]]
+    if flipped:
+        worst = max(r["lockstep_native"]["max_logit_delta"] for r in flipped)
+        print(
+            f"at the timed precision, {len(flipped)}/{len(rows)} points decoded "
+            f"different tokens. Largest lockstep logit delta {worst:.5f}, which is "
+            "rounding, not a different computation: greedy argmax flips whenever "
+            "the top-2 gap is narrower than that. Quote the fp32 gate as the "
+            "correctness result and this as a property of the precision."
+        )
 
     if args.out:
         out = Path(args.out)

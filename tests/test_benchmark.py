@@ -13,11 +13,14 @@ from __future__ import annotations
 import pytest
 import torch
 
+from contextlib import nullcontext
+
 from story_moe.benchmark import (
     _cache_reserved_mib,
     _fmt,
     benchmark_point,
     default_grid,
+    lockstep_compare,
     time_median_ms,
 )
 from story_moe.config import config_from_dict
@@ -44,8 +47,26 @@ def test_config_round_trips_through_a_dict() -> None:
 def test_benchmark_point_reports_agreeing_outputs(model: StoryLM) -> None:
     row = benchmark_point(model, prompt_len=4, replay_len=8, device="cpu",
                           precision="fp32", warmup=0, trials=1)
-    assert row["outputs_agree"] is True
+    assert row["outputs_agree_fp32"] is True
+    assert row["outputs_agree_native"] is True
     assert row["prompt_tokens"] == 4 and row["replay_tokens"] == 8
+
+
+def test_lockstep_finds_no_difference_when_the_cache_is_right(model: StoryLM) -> None:
+    """In fp32 the two paths are the same computation, so the delta is noise.
+
+    This is the quantitative form of the Day 6 gate. A wrong RoPE offset or a
+    per-layer length skew would show up here as a large delta at step 0, which
+    is what distinguishes a broken cache from reduced-precision tie-breaking.
+    """
+    torch.manual_seed(3)
+    prompt = torch.randint(0, model.cfg.model.vocab_size, (1, 6))
+    report = lockstep_compare(model, prompt, n_steps=8, amp=nullcontext)
+
+    assert report["argmax_disagreements"] == 0
+    assert report["first_disagreement"] is None
+    assert report["max_logit_delta"] < 1e-4
+    assert report["steps"] == 8
 
 
 def test_per_token_cost_excludes_prefill(model: StoryLM) -> None:
