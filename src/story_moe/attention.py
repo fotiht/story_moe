@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .cache import KVCache
 from .config import Config
 from .rope import apply_rope
 
@@ -81,10 +82,24 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         past_len: int = 0,
+        cache: KVCache | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
+        """[B, T, D] -> [B, T, D].
+
+        With a cache, `past_len` comes from the cache rather than the caller, so
+        there is one source of truth for "how many tokens came before these".
+        The T new tokens are appended and attention scores against every stored
+        position, giving scores [B, H, T, past_len + T].
+        """
         B, T, D = x.shape
         if D != self.d_model:
             raise ValueError(f"expected last dim {self.d_model}, got {D}")
+
+        if cache is not None:
+            if past_len:
+                raise ValueError("pass past_len or a cache, not both")
+            past_len = cache.length
 
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
@@ -96,7 +111,12 @@ class CausalSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin, offset=past_len)
         k = apply_rope(k, cos, sin, offset=past_len)
 
-        scores = (q @ k.transpose(-2, -1)) * self.scale      # [B, H, T, T]
+        # Rotate first, then store. A cached key is rotated exactly once, at the
+        # position it arrived at, and is never touched again.
+        if cache is not None:
+            k, v = cache.append(layer_idx, k, v)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale      # [B, H, T, past+T]
 
         allowed = offset_causal_mask(T, k.shape[-2], past_len, x.device)
         scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)

@@ -1,8 +1,8 @@
 """Pre-norm decoder block and the language model.
 
-DAY 4 SCOPE. Attention, the loss, RoPE, and the sparse Top-k MoE feed-forward.
-The temporary learned positional embedding from Day 2 was DELETED, not disabled.
-The KV cache is not here yet.
+DAY 6 SCOPE. Attention, the loss, RoPE, the sparse Top-k MoE feed-forward, and
+the KV cache. The temporary learned positional embedding from Day 2 was DELETED,
+not disabled.
 
 Dense and MoE share every line of this file except which module fills the
 feed-forward slot, which is what makes the comparison controlled.
@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .attention import CausalSelfAttention
+from .cache import KVCache
 from .config import Config
 from .moe import FeedForward, RouterStats, SparseMoE
 from .rope import rope_tables
@@ -42,16 +43,20 @@ class ModelOutput:
     lm_loss: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
     total_loss: torch.Tensor | None = None
-    past_key_values: list | None = None            # Day 6
+    # The same KVCache object that was passed in, advanced by this call. Handed
+    # back so a generation loop can read it off the output instead of keeping a
+    # second reference; it is not a copy.
+    past_key_values: "KVCache | None" = None
     router_stats: list[RouterStats] | None = None  # detached, opt-in
 
 
 class DecoderBlock(nn.Module):
     """Pre-norm: x = x + attn(norm1(x)); x = x + ff(norm2(x))."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, layer_idx: int = 0):
         super().__init__()
         m = cfg.model
+        self.layer_idx = layer_idx
         self.norm1 = nn.LayerNorm(m.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.norm2 = nn.LayerNorm(m.d_model)
@@ -70,8 +75,12 @@ class DecoderBlock(nn.Module):
         past_len: int = 0,
         need_aux: bool = True,
         collect_stats: bool = False,
+        cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, RouterStats | None]:
-        x = x + self.attn(self.norm1(x), cos, sin, past_len=past_len)
+        x = x + self.attn(
+            self.norm1(x), cos, sin,
+            past_len=past_len, cache=cache, layer_idx=self.layer_idx,
+        )
         h = self.norm2(x)
         if self.use_moe:
             ff, aux, stats = self.feed_forward(h, need_aux=need_aux, collect_stats=collect_stats)
@@ -100,7 +109,9 @@ class StoryLM(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
-        self.blocks = nn.ModuleList(DecoderBlock(cfg) for _ in range(m.n_layers))
+        self.blocks = nn.ModuleList(
+            DecoderBlock(cfg, layer_idx=i) for i in range(m.n_layers)
+        )
         self.final_norm = nn.LayerNorm(m.d_model)
         self.lm_head = nn.Linear(m.d_model, m.vocab_size, bias=False)
         if m.tie_weights:
@@ -129,6 +140,7 @@ class StoryLM(nn.Module):
         targets: torch.Tensor | None = None,
         logits_to_keep: int | None = None,
         collect_stats: bool = False,
+        cache: KVCache | None = None,
     ) -> ModelOutput:
         """[B, T] -> ModelOutput.
 
@@ -136,15 +148,33 @@ class StoryLM(nn.Module):
         Generation uses k=1; training and evaluation need every position, so
         passing both targets and logits_to_keep is rejected rather than silently
         scoring a suffix.
+
+        `cache` makes this an incremental step: input_ids are the NEW tokens
+        only, they are treated as occupying positions cache.length ..
+        cache.length+T-1, and the cache is advanced by T before returning. Pass
+        the whole prompt for prefill and one token per step after that.
         """
         if input_ids.dtype not in (torch.int64, torch.int32):
             raise TypeError(f"input_ids must be integer dtype, got {input_ids.dtype}")
         if targets is not None and logits_to_keep:
             raise ValueError("targets requires full logits; do not pass logits_to_keep")
+        if cache is not None and targets is not None:
+            raise ValueError(
+                "the cache is for generation, not training; training recomputes "
+                "every position and needs gradients through the keys and values"
+            )
 
         B, T = input_ids.shape
-        if T > self.cfg.model.max_seq_len:
-            raise ValueError(f"sequence length {T} exceeds max_seq_len {self.cfg.model.max_seq_len}")
+        past_len = cache.length if cache is not None else 0
+        if past_len + T > self.cfg.model.max_seq_len:
+            raise ValueError(
+                f"positions {past_len}..{past_len + T - 1} exceed max_seq_len "
+                f"{self.cfg.model.max_seq_len}"
+            )
+        if cache is not None and cache.n_layers != len(self.blocks):
+            raise ValueError(
+                f"cache holds {cache.n_layers} layers, model has {len(self.blocks)}"
+            )
 
         x = self.drop(self.token_emb(input_ids))
 
@@ -157,13 +187,19 @@ class StoryLM(nn.Module):
 
         for block in self.blocks:
             x, aux, stat = block(
-                x, self.rope_cos, self.rope_sin, past_len=0,
-                need_aux=need_aux, collect_stats=collect_stats,
+                x, self.rope_cos, self.rope_sin,
+                need_aux=need_aux, collect_stats=collect_stats, cache=cache,
             )
             if aux is not None:
                 aux_terms.append(aux)
             if stat is not None:
                 stats.append(stat)
+
+        # Every layer appended the same T positions, so the shared length moves
+        # once, here, after the last of them. Advancing inside append() would
+        # skew layer 1 one chunk past layer 0.
+        if cache is not None:
+            cache.advance(T)
 
         x = self.final_norm(x)
 
@@ -195,8 +231,18 @@ class StoryLM(nn.Module):
             lm_loss=lm_loss,
             aux_loss=aux_loss,
             total_loss=total_loss,
+            past_key_values=cache,
             router_stats=stats or None,
         )
+
+    def new_cache(self, max_len: int | None = None) -> KVCache:
+        """An empty cache sized for this model. Capacity defaults to max_seq_len."""
+        limit = self.cfg.model.max_seq_len
+        if max_len is None:
+            max_len = limit
+        elif max_len > limit:
+            raise ValueError(f"max_len {max_len} exceeds max_seq_len {limit}")
+        return KVCache(n_layers=len(self.blocks), max_len=max_len)
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:

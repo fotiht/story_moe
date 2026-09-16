@@ -266,7 +266,7 @@ def test_moe_model_builds_and_separates_losses():
 
     out = m(x, targets=y, collect_stats=True)
     assert out.logits.shape == (2, 16, VOCAB)
-    assert float(out.aux_loss) > 0.0, "MoE auxiliary loss should not be zero"
+    assert out.aux_loss.item() > 0.0, "MoE auxiliary loss should not be zero"
     expected = out.lm_loss + cfg.model.aux_loss_weight * out.aux_loss
     torch.testing.assert_close(out.total_loss, expected)
     assert out.router_stats is not None

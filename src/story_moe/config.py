@@ -127,6 +127,23 @@ class Config:
         return asdict(self)
 
 
+def config_from_dict(raw: dict[str, Any]) -> Config:
+    """Rebuild a Config from `to_dict()` output, e.g. a checkpoint's own copy.
+
+    Loading a checkpoint this way rather than from a YAML file means the model
+    is always built with the shapes it was trained with, even if the YAML has
+    been edited since.
+    """
+    cfg = Config(
+        name=raw.get("name", "checkpoint"),
+        model=ModelConfig(**raw["model"]),
+        data=DataConfig(**raw.get("data", {})),
+        train=TrainConfig(**raw.get("train", {})),
+    )
+    cfg.validate()
+    return cfg
+
+
 def load_config(path: str | Path) -> Config:
     """Read a YAML config, build the dataclasses, and validate invariants."""
     path = Path(path)
