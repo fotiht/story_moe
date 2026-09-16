@@ -9,9 +9,9 @@ validation, checkpoint/resume, the sparse Top-2 MoE and the KV cache are all
 verified. The MoE is checked against a dense all-experts oracle on its outputs
 and its gradients. The cache is checked against an uncached forward pass, in the
 test suite and again in fp32 on the trained models. Resume is verified on an
-A100 as well as on CPU. Both full 20M-token runs finished on the same A100 in bf16, and
-the cache benchmarks ran on the trained checkpoints. Every number below came off
-a run.
+A100 as well as on CPU. Both full 20M-token runs finished on the same A100 in
+bf16, and the cache benchmarks ran on the trained checkpoints. Every number
+below came off a run.
 
 ## Setup
 
@@ -50,7 +50,10 @@ python -m story_moe.generate --checkpoint checkpoints/train_moe/latest.pt --prom
 # 7. Measure the KV cache against an uncached decode.
 python -m story_moe.benchmark --checkpoint checkpoints/train_moe/latest.pt --precision bf16 --batch-size 32 --out results/bench_moe.json
 
-# 8. Run the test suite.
+# 8. Redraw the README figure from the benchmark JSON.
+python docs/make_figures.py
+
+# 9. Run the test suite.
 pytest -q
 ```
 
@@ -368,6 +371,15 @@ recorded flips happened at a measured top-2 gap of exactly 0.0, meaning two
 tokens with identical bf16 logits. One flipped token then makes every later token
 differ. The benchmark therefore fails only on an fp32 mismatch, and reports bf16
 token divergence alongside the logit deltas that explain it.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/cache-overhead-dark.svg">
+  <img src="docs/cache-overhead-light.svg" alt="Decode cost per token against context length, at batch 1 and batch 32. At batch 1 the cached and uncached paths are both flat across a 32x range of context. At batch 32 the uncached path rises sharply past 256 tokens of context while the cached path stays flat.">
+</picture>
+
+Regenerate the figure with `python docs/make_figures.py`. It reads
+`results/bench_*.json` and writes both SVGs, so the picture cannot drift from
+the measurements.
 
 Timings, `NVIDIA A100-SXM4-40GB`, bf16, torch 2.11.0+cu128, median of 5 trials
 after 2 warmup, decode cost excluding prefill:
