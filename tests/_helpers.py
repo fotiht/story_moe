@@ -1,4 +1,9 @@
-"""Shared test fixtures: a small model config that needs no tokenizer or network."""
+"""Shared test fixtures. The config here is small enough to build in code, so
+nothing in the suite needs a tokenizer or a network connection.
+
+block_size is fixed at 16. The config validator rejects block_size >
+max_seq_len, so any test that shrinks max_seq_len cannot go below 16.
+"""
 
 from story_moe.config import Config, DataConfig, ModelConfig
 

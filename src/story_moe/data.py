@@ -2,24 +2,24 @@
 
 Layout of this module, in dependency order:
 
-  1. pack_blocks / block_count  - pure Python, no torch, no HuggingFace.
-     This is the part that decides input/target alignment, so it is kept
-     dependency-free and is unit-tested on hand-written token lists.
-  2. load_tokenizer / select_stories / prepare_split - needs `transformers`
-     and `datasets`. Writes a uint16 cache so repeated runs do not retokenize.
-  3. Batcher - needs torch. Turns cached blocks into [B, T] input/target pairs.
+  1. pack_blocks / block_count. Pure Python, no torch, no HuggingFace. This is
+     the part that decides input/target alignment, so it stays dependency-free
+     and is unit-tested on hand-written token lists.
+  2. load_tokenizer / select_stories / prepare_split. Needs `transformers` and
+     `datasets`. Writes a uint16 cache so repeated runs do not retokenize.
+  3. Batcher. Needs torch. Turns cached blocks into [B, T] input/target pairs.
 
-Data contract (fixed for BOTH the dense and MoE runs):
+Data contract, fixed for the dense run and the MoE run alike:
   - Each story is tokenized with add_special_tokens=False, then exactly one EOS
     is appended as the story separator.
   - Stories in a split are concatenated into one stream, then cut into windows of
     block_size + 1 tokens taken every `stride` tokens.
-  - inputs = window[:-1], targets = window[1:]  ->  target[i] is the token that
+  - inputs = window[:-1], targets = window[1:], so target[i] is the token that
     follows input[i].
-  - The trailing remainder that cannot fill a whole window is DISCARDED. It is
-    never padded and never scored. The discarded count is recorded in meta.json.
+  - The trailing remainder that cannot fill a whole window is discarded. It is
+    never padded and never scored. The discarded count goes into meta.json.
   - Attention is allowed to cross story boundaries inside a block. EOS does not
-    reset attention; it is only a token the model can learn to predict.
+    reset attention. It is only a token the model can learn to predict.
 """
 
 from __future__ import annotations
@@ -200,10 +200,10 @@ def load_cached_split(cache_dir: Path, split: str) -> tuple[np.ndarray, dict[str
 def check_cache_matches_config(meta: dict[str, Any], cfg, split: str) -> None:
     """Refuse to train on a cache that does not match the active config.
 
-    Without this, pointing a 512-token config at the 128-token cache runs
-    perfectly happily: the batcher just yields shorter rows, the model accepts
-    them, and every processed-token count in the logs and the results JSON is
-    wrong by a factor of four. Silent bad accounting is worse than a crash.
+    Point a 512-token config at the 128-token cache and nothing complains. The
+    batcher yields shorter rows, the model takes them, and every processed-token
+    count in the logs and the results JSON overcounts by a factor of four.
+    Silent bad accounting is worse than a crash.
     """
     expected = {
         "block_size": cfg.data.block_size,
@@ -254,12 +254,13 @@ def check_cache_matches_config(meta: dict[str, Any], cfg, split: str) -> None:
 class Batcher:
     """Yields (inputs, targets) of shape [B, T], both int64, from cached blocks.
 
-    Sampling is WITHOUT replacement: a shuffled permutation is consumed in order
-    and reshuffled when exhausted. This matters for honesty about coverage.
-    Drawing n times with replacement from n blocks touches only 1 - (1-1/n)^n
-    ~= 63% of them, so a "one pass" budget under `torch.randint` would leave a
-    third of the data unseen while showing others twice. With a permutation,
-    "0.98 passes" means 98% of the blocks, each exactly once.
+    Sampling is without replacement. A shuffled permutation is consumed in
+    order and reshuffled once exhausted, so a coverage figure means what it
+    says. Drawing n times with replacement from n blocks touches only
+    1 - (1-1/n)^n ~= 63% of them, so a "one pass" budget built on
+    `torch.randint` would leave a third of the data unseen while showing other
+    blocks twice. With a permutation, "0.98 passes" means 98% of the blocks,
+    each exactly once.
 
     `epochs_seen()` reports the true fractional position in the data.
     """
@@ -302,7 +303,7 @@ class Batcher:
             remaining -= take
 
         idx = torch.cat(taken).numpy()
-        # int64 first: uint16 is not a torch dtype.
+        # int64 first, because uint16 is not a torch dtype.
         window = torch.from_numpy(self.blocks[idx].astype(np.int64))
         return window[:, :-1].to(device), window[:, 1:].to(device)
 
@@ -369,7 +370,7 @@ def _cmd_show(cfg) -> None:
     assert x.dtype == torch.int64 and y.dtype == torch.int64, "token IDs must be int64"
     assert int(x.min()) >= 0 and int(x.max()) < V, f"input IDs outside [0, {V})"
     assert int(y.min()) >= 0 and int(y.max()) < V, f"target IDs outside [0, {V})"
-    # The shift: target[:, i] must equal input[:, i+1] for every position.
+    # Check the shift directly. target[:, i] must equal input[:, i+1] everywhere.
     assert torch.equal(y[:, :-1], x[:, 1:]), "targets are not the inputs shifted by one"
     print("assertions     : OK (shape, dtype, ID range, single shift)")
 

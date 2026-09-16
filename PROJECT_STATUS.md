@@ -4,32 +4,29 @@ Updated: 2026-09-16 (days 1 to 7 complete)
 
 ## Current milestone
 
-All seven days are done and measured. Days 1 to 5 as before; Day 6 added the KV
-cache and Day 7 the generation CLI, the cache benchmark and the results tables.
-The suite passes at 111, so the earlier dead-code cleanup is confirmed.
-
-Nothing in the README is projected any more. Every figure came off a run.
+All seven days are done and measured. Days 1 to 5 are unchanged. Day 6 added the
+KV cache, and Day 7 the generation CLI, the cache benchmark and the results
+tables. A later cleanup pass removed dead code and rewrote the prose, and the
+suite settled at 109 passing. Every figure in the README came off a run.
 
 ## Day 6 and 7 results
 
 ### The cache is correct
 
-The fp32 gate passed at all 22 benchmark grid points on the trained models:
-cached and uncached decode produced identical tokens. The lockstep comparison,
-which feeds both paths the same tokens and compares logits directly, put the
-largest fp32 difference at 2.1e-5 against logits of magnitude 16, a relative
-1e-6. That is reassociation noise, which is what an identity computed two ways
-should look like.
+The fp32 gate passed at all 22 benchmark grid points on the trained models, with
+cached and uncached decode producing identical tokens. The lockstep comparison
+feeds both paths the same tokens and compares logits directly. It put the largest
+fp32 difference at 2.1e-5 against logits of magnitude 16, a relative 1e-6. That
+is reassociation noise, which is how an identity computed two ways should look.
 
-### bf16 token divergence is rounding, not a bug
+### bf16 token divergence is rounding
 
 In bf16 some points decoded different tokens. The lockstep delta there is 0.0625
-at batch 1, which is exactly one ULP: bf16 has 8 mantissa bits, so near 15 the
-spacing is 2^3 * 2^-8 = 0.0625. Several recorded flips had a top-2 gap of
-exactly 0.0, meaning two tokens with identical bf16 logits, where argmax falls
-to index order and any perturbation flips it. One flipped token then makes every
-later token differ, which is why free-running greedy comparison looked like
-total failure.
+at batch 1, exactly one ULP. bf16 has 8 mantissa bits, so the spacing near 15 is
+2^3 * 2^-8 = 0.0625. Several recorded flips had a top-2 gap of exactly 0.0,
+meaning two tokens with identical bf16 logits, where argmax falls to index order
+and any perturbation flips it. One flipped token then makes every later token
+differ, which is why free-running greedy comparison looked like total failure.
 
 The benchmark now fails only on an fp32 mismatch and reports bf16 divergence
 with the logit deltas beside it. That change was made after the measurement, not
@@ -51,27 +48,27 @@ before it, and the first version did hard-fail the run.
 
 I predicted the per-token speedup would grow roughly linearly with sequence
 length. It does not. Decode at this model size is bound by Python dispatch and
-kernel launch, not arithmetic:
+kernel launch rather than by arithmetic.
 
 - Dense cached decode costs 7.05 ms/token at 16 tokens of context and 7.97 at
-  512. A 32x range of context, 13% of time.
+  512, so a 32x range of context buys 13% of the time.
 - Dense cached decode costs 8.39 ms/token at batch 32, where each step produces
-  32 tokens instead of 1. Thirty-two times the work, 5% more time.
+  32 tokens instead of 1. Thirty-two times the work for 5% more time.
 - Prefill costs 9.35 ms for 8 tokens and 9.73 ms for 8,192.
 
-That is a floor of roughly 8 ms per step dense and 18 ms MoE, under which saved
-arithmetic is invisible. The uncached path matches the cached path until its
+The floor is roughly 8 ms per step dense and 18 ms MoE, and saved arithmetic is
+invisible underneath it. The uncached path matches the cached path until its
 recomputation exceeds that floor. At batch 1 it never does within a 512-token
-context; at batch 32 the crossover sits between 256 and 512 tokens of context
+context. At batch 32 the crossover sits between 256 and 512 tokens of context
 (8.02 ms at 256, 15.19 at 512).
 
-MoE shows a bigger batch-1 speedup than dense (1.26x to 1.43x against 1.02x to
-1.17x) for the same reason inverted: gather, four experts and scatter put more
+MoE shows a bigger batch-1 speedup than dense, 1.26x to 1.43x against 1.02x to
+1.17x, for the same reason inverted. Gather, four experts and scatter put more
 real arithmetic under the same overhead.
 
-Batching is the larger lever: dense cached decode goes from 125 tok/s at batch 1
-to 3,814 tok/s at batch 32, 30x from the same cache, because batching is what
-makes a step compute-bound in the first place.
+Batching is the larger lever. Dense cached decode goes from 125 tok/s at batch 1
+to 3,814 tok/s at batch 32, a 30x gain from the same cache, because batching is
+what makes a step compute-bound in the first place.
 
 ### The memory prediction did hold
 
@@ -88,12 +85,12 @@ score matrix every step, which costs more than the cache avoids.
 2. `default_grid` started at (16, 32) and returned nothing for any model with
    max_seq_len under 48, so the benchmark refused to run rather than picking
    smaller points. Caught by its own test.
-3. Fixing 2 exposed a latent crash: at short grid points on a fast GPU,
-   `cached_total - prefill` falls below timer resolution, making the speedup
-   None, which the print line formatted with `:5.2f`. Now prints `n/a`.
+3. Fixing 2 exposed a latent crash. At short grid points on a fast GPU,
+   `cached_total - prefill` falls below timer resolution, which makes the speedup
+   None, and the print line formatted it with `:5.2f`. Now prints `n/a`.
 4. The lockstep diagnostic reported batch row 0 rather than the row that
    actually diverged, so at batch 32 it printed two identical tokens as evidence
-   of a disagreement. Found by reading the run output, not by a test.
+   of a disagreement. Reading the run output caught this. No test did.
 5. `_cache_reserved_mib` computed at fp32 always, overstating a bf16 run's cache
    by exactly 2x.
 
@@ -125,8 +122,8 @@ Both step-0 language losses sit within 0.09 of ln(50257) = 10.825, so the
 initial-loss assertion held at the experiment tier too.
 
 MoE gradient norms ran consistently below dense in steady state, about 0.73
-against 1.02 at the last step. Not investigated; noting it rather than
-explaining it.
+against 1.02 at the last step. Not investigated, so this is a note and not an
+explanation.
 
 ### Routing over the full run
 
@@ -148,10 +145,10 @@ trend was the wrong call. `aux` moved across a range of about 0.04 over the whol
 run while the fractions moved visibly, which is one more reason not to use it as
 the balance diagnostic.
 
-Caveat on the numbers above: the log records the layer average, so per-layer skew
-in opposite directions would partly cancel. `RouterStats` is collected per layer;
-only the mean is written out. Worth a per-layer dump on Day 7 if expert behaviour
-gets discussed at all.
+One caveat on the numbers above. The log records the layer average, so per-layer skew
+in opposite directions would partly cancel. `RouterStats` is collected per
+layer, but only the mean is written out. A per-layer dump is worth adding
+before anyone discusses expert behaviour.
 
 ### Verified on the A100 (torch 2.11.0+cu128, bf16)
 
@@ -160,8 +157,8 @@ gets discussed at all.
 GPU resume smoke passed, step 3 to 4. Checkpoint keys
 `['batcher', 'best_val_nll', 'config', 'epochs_seen', 'model', 'optimizer',
 'processed_tokens', 'rng', 'scaler', 'step', 'tokenizer']`. The CPU run could
-not perform this test at all, and passing it is what makes a long Colab run
-survivable.
+not perform this test at all, and a long Colab run is only survivable because
+this one passes.
 
 First real training result, at the debug tier: 244 updates, 999,424 processed
 tokens over 1,000 stories, which is 4.43 passes and therefore memorization-
@@ -176,7 +173,7 @@ step 243/244  lm  5.4466
 Perplexity 255.6 against a uniform predictor's 50,257. Marginal throughput over
 the last 40 updates was about 54,900 tok/s, matching the earlier probe within 2%.
 
-The `results/*.json` history field works: a controlled 3-update run with the
+The `results/*.json` history field works. A controlled 3-update run with the
 file deleted first produced `history entries: 3`. An earlier check reported 0 on
 a file that could not be traced to a specific run. Unexplained, not reproduced,
 and not blocking. Re-check if it recurs.
@@ -199,9 +196,9 @@ Three real bugs, all of which produce plausible runs rather than crashes:
 3. Sampling was with replacement. `torch.randint` over n blocks reaches only
    `1-(1-1/n)^n ~= 63%` of them in n draws, so "0.98 passes" was a budget ratio,
    not coverage. `Batcher` now consumes a shuffled permutation and reshuffles at
-   epoch boundaries; permutation, cursor and epoch are checkpointed.
+   epoch boundaries, and permutation, cursor and epoch are all checkpointed.
 
-Plus: routing statistics are now collected on logging steps and aggregated over
+Routing statistics are now collected on logging steps and aggregated over
 every microbatch of the update, and several overstated claims were corrected
 (see the Day 4 note on the auxiliary loss, and the FLOP accounting above).
 
@@ -216,15 +213,15 @@ every microbatch of the update, and several overstated claims were corrected
 | `train_moe` | 60,800 | 4,642 MiB | 60,605,568 | 41,306,880 | 7.9990 |
 
 The MoE is 2.01 times slower per token. That is the gather and scatter dispatch
-cost, measured rather than assumed, and it does not threaten the plan: at 20M
+cost, measured rather than assumed, and it does not threaten the plan. At 20M
 tokens the runs cost 2.7 and 5.5 minutes. Open item 2 is closed.
 
 The experiment tier is 2.2 times faster per token than the debug tier's 55,800
 despite six times the compute, because the larger tensors use the card better.
 Peak memory is 11% of 40 GB.
 
-Cache, prepared once and shared: train 39,361 blocks over 90,000 stories,
-20,152,860 unique tokens, 27 discarded, 20,152,832 scored targets; validation
+Cache, prepared once and shared. Train has 39,361 blocks over 90,000 stories,
+20,152,860 unique tokens, 27 discarded, 20,152,832 scored targets. Validation
 854 blocks over 2,000 stories, 210 discarded, 437,248 scored targets. 223.9
 tokens per story, and the 20M-token budget covers 0.99 passes.
 
@@ -238,7 +235,7 @@ step 29  [0.286 0.310 0.215 0.189]   max/min 1.64
 ```
 
 Imbalance forming, not collapse. Warmup is 60 updates and the probe was 30, so
-the learning rate never reached peak; the trend is suggestive only. `aux` moved
+the learning rate never reached peak, so the trend is suggestive only. `aux` moved
 1.021 to 1.076 alongside it, so once the probabilities stop being uniform the
 auxiliary loss does carry some signal. The assignment fractions remain the
 direct reading.
@@ -281,11 +278,11 @@ Day 1. Cache for 1,000/200 stories, block_size 128, stride 128, gpt2
 
 ~226 tokens per story.
 
-Day 2. The overfit collapsed from 10.7838 to 0.0018 at 100% next-token accuracy;
-step-0 loss within 0.041 of ln(50257) = 10.825.
+Day 2. The overfit collapsed from 10.7838 to 0.0018 at 100% next-token accuracy.
+Step-0 loss came within 0.041 of ln(50257) = 10.825.
 
 Day 3. 40 tests pass, `resume-smoke` passes (step 3 to 4), and the parameters read
-`total=6,827,392 embedding=6,432,896 (94.2%) body=394,496`; body reproduces
+`total=6,827,392 embedding=6,432,896 (94.2%) body=394,496`, and body reproduces
 exactly as 131,072 attention + 262,144 MLP + 1,280 LayerNorm.
 
 A100 probe, 50 updates, debug tier, bf16, `NVIDIA A100-SXM4-40GB`,
@@ -315,10 +312,10 @@ At the larger tier the totals are 41.72M against 60.60M (bodies 22.42M against
 
 Budget: 20M processed tokens over 90,000 stories, which the runs confirmed at
 0.9918 passes. (Sampling is
-now without replacement, so this ratio is genuine coverage; with the previous
+now without replacement, so this ratio is genuine coverage. With the previous
 `torch.randint` sampler the same budget would have reached only 63% of blocks.)
-The spec's 1M to 5M suggestion is 18 to 90 seconds on this GPU; there is no reason to be that
-small. 90k stories x 226 tokens ≈ 20.3M unique, so the run is close to a single
+The spec's 1M to 5M suggestion is 18 to 90 seconds on this GPU, so there is no
+reason to be that small. 90k stories x 226 tokens ≈ 20.3M unique, so the run is close to a single
 epoch rather than 4 to 22 repeats.
 
 Experiment settings: block_size 512, microbatch 8, accum 4, giving 16,384 tokens per
@@ -346,7 +343,7 @@ step-0 loss 10.8397 vs ln(V) = 10.825, off by 0.015     verdict: PASS
 dense body = 657,664 / 394,496 = 1.667, matching the config-shape derivation.
 
 `aux` stayed between 0.9989 and 1.0175 for all 200 steps. This corrects an
-earlier reading: that does NOT demonstrate balanced routing. With
+earlier reading. That does not demonstrate balanced routing. With
 `L = E * sum_e f_e * P_e`, near-uniform probabilities `P_e ~= 1/E` give
 `L = E * (1/E) * sum_e f_e = 1` for ANY assignment distribution, including every
 token collapsing onto one expert. Worked counterexample: E=4, P uniform,
@@ -356,13 +353,13 @@ uninformative. `assignment_fraction` carries the information instead, which is
 why the training loop now logs it.
 
 MoE converged slightly slower than dense (step 25: 5.06 vs 4.85), which is
-expected: the router is an additional thing to learn.
+expected, since the router is one more thing to learn.
 
 ### What Day 4 added
 
 - `SparseMoE.route` does a float32 softmax and `topk`, with selected weights renormalized to
   sum to 1, and never detached, so the language loss trains the router.
-- Dispatch, per expert: gather assigned rows, one MLP call, weight,
+- Dispatch, per expert. Gather assigned rows, one MLP call, weight,
   `index_add` back. k*N token-expert evaluations, not E*N, with a test that
   counts them.
 - `balance_loss` uses `f_e` over k*N assignments (detached), `P_e` the mean full
@@ -371,8 +368,8 @@ expected: the router is an additional thing to learn.
   token count. Detached, opt-in.
 - `need_aux=False` skips the balancing reduction in inference, so no diagnostic
   work distinguishes the cached and uncached benchmark paths on Day 7.
-- `DecoderBlock` returns `(x, aux, stats)`; `StoryLM` averages aux across MoE
-  layers. Dense aux is exactly 0.
+- `DecoderBlock` returns `(x, aux, stats)` and `StoryLM` averages aux across the
+  MoE layers. Dense aux is exactly 0.
 
 ## Next action
 
@@ -401,10 +398,10 @@ Optional work, if the project continues past the plan:
 ## Decisions log
 
 - `max_seq_len` 256 at the debug tier (benchmark grid needs prompt 128 + 64).
-- Stride = `block_size`; every token after the first is a target exactly once.
+- Stride = `block_size`, so every token after the first is a target exactly once.
 - `vocab_size` resolved at runtime from `len(tokenizer)`.
 - `train.device` / `precision` / `require_gpu_name` asserted at startup.
-- `count_parameters` splits embedding from body; body is the comparison number.
+- `count_parameters` splits embedding from body. Body is the comparison number.
 - Attention explicit, no SDPA, until the reference is matched.
 - `warmup_steps` cut from 100 to 20 at the debug tier, 60 at the experiment tier (~5%).
 - Resume is "state reloads and training continues", never bitwise-identical.
@@ -420,13 +417,13 @@ Optional work, if the project continues past the plan:
    not keep the objective as a whole identical: `balance_loss` estimates `f_e` and `P_e` from
    one microbatch, so changing the microbatch size changes the auxiliary
    gradient. Treat a microbatch change as a config change to disclose, not a
-   free optimization. Worth a sweep before the real runs; keep it identical
+   free optimization. Worth a sweep before the real runs, and keep it identical
    across the dense and MoE runs either way.
 2. Resolved. MoE throughput measured at 60,800 tok/s against the dense model's
    122,100, a 2.01x slowdown that costs 5.5 minutes instead of 2.7 at the full
    budget.
-3. Repo is inside OneDrive; `.gitignore` keeps `data/` and `checkpoints/` out of
-   Git but not out of sync. Experiment checkpoints will be ~500 MB each at
+3. The repo lives inside OneDrive. `.gitignore` keeps `data/` and `checkpoints/`
+   out of Git but not out of sync. Experiment checkpoints will be ~500 MB each at
    41.7M/60.6M parameters with Adam moments, so these go to Drive via `--out-dir`,
    not into the repo folder.
 

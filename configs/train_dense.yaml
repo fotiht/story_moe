@@ -7,7 +7,7 @@
 #     feed-forward change barely moves either quality or throughput
 # At this tier the split is 41.7M vs 60.6M parameters and 46% embedding share.
 #
-# train_moe.yaml must differ from this file ONLY in the feed-forward fields.
+# train_moe.yaml must differ from this file only in the feed-forward fields.
 name: train_dense
 
 model:
@@ -17,8 +17,8 @@ model:
   d_head: 64
   max_seq_len: 512
   use_moe: false
-  dense_width: 4096      # 2 * expert_width: approximate active-MLP compute match
-  expert_width: 2048     # unused here; stated so the recorded config shows the matched pair
+  dense_width: 4096      # 2 * expert_width, an approximate active-MLP compute match
+  expert_width: 2048     # unused here, stated so the recorded config shows the matched pair
   rope_base: 10000.0
   dropout: 0.0
   tie_weights: true
@@ -34,7 +34,7 @@ data:
   seed: 1234
   block_size: 512
   stride: null
-  cache_dir: data/cache_512   # NOT the debug cache: different block size
+  cache_dir: data/cache_512   # NOT the debug cache, which has a different block size
 
 train:
   lr: 3.0e-4
@@ -49,5 +49,5 @@ train:
   ckpt_every: 200
   out_dir: checkpoints/train_dense
   device: cuda
-  precision: bf16            # A100 supports bf16; confirmed by the notebook probe
+  precision: bf16            # A100 supports bf16, confirmed by the notebook probe
   require_gpu_name: A100     # refuse to run on a reassigned Colab GPU

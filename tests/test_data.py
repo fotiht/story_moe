@@ -1,8 +1,9 @@
 """Day 1 gate: the data contract.
 
 These tests use hand-written token lists, not the real dataset, so they run
-without `transformers`, `datasets` or a network connection. They test the one
-thing that silently ruins a language model: input/target alignment.
+without `transformers`, `datasets` or a network connection. The one thing they
+check is input/target alignment, which ruins a language model silently when it
+is wrong.
 """
 
 import pytest
@@ -26,15 +27,15 @@ def test_every_target_is_the_next_token():
     for block in blocks:
         x, y = split_inputs_targets(block)
         assert len(x) == len(y) == 8
-        # The shift, stated the only way that matters: y[i] follows x[i].
+        # The shift, stated the only way that matters, is that y[i] follows x[i].
         for i in range(len(x)):
             assert y[i] == block[i + 1]
-        # And no double shift: y[:-1] must equal x[1:].
+        # And no double shift, so y[:-1] must equal x[1:].
         assert y[:-1] == x[1:]
 
 
 def test_no_token_is_scored_twice_with_default_stride():
-    """stride == block_size: every stream position after the first is a target once."""
+    """With stride == block_size, every stream position after the first is a target once."""
     stories = [list(range(1, 33))]
     T = 8
     blocks, _ = pack_blocks(stories, EOS, block_size=T, stride=T)
@@ -51,11 +52,11 @@ def test_remainder_is_discarded_not_padded():
     stories = [list(range(1, 20))]  # stream length 20 after EOS
     T = 8
     blocks, discarded = pack_blocks(stories, EOS, block_size=T, stride=T)
-    # windows of 9 every 8: starts at 0 and 8 -> covers 0..16, so 3 tokens are dropped
+    # windows of 9 every 8, starting at 0 and 8 -> covers 0..16, so 3 tokens are dropped
     assert len(blocks) == 2
     assert discarded == 3
     assert all(len(b) == T + 1 for b in blocks)
-    # nothing invented: no padding value appears
+    # nothing invented, no padding value appears
     flat = [t for b in blocks for t in b]
     assert all(t != 0 for t in flat)
 

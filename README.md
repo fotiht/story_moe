@@ -1,17 +1,17 @@
 # story_moe: decoder-only transformer with RoPE, sparse Top-2 MoE, and KV cache
 
 A next-token language model trained from random initialization on a fixed
-TinyStories subset. It continues short story prompts; it is not an
+TinyStories subset. It continues short story prompts. It is not an
 instruction-tuned assistant.
 
-Status: the 7-day plan is complete. The data pipeline, causal attention, RoPE,
-the loss, validation, checkpoint/resume, the sparse Top-2 MoE and the KV cache
-are all verified. The MoE is checked against a dense all-experts oracle on both
-outputs and gradients; the cache is checked against an uncached forward pass, in
-the test suite and again in fp32 on the trained models. Resume is verified on an
-A100, not only on CPU. Both full 20M-token runs finished on the same A100 in
-bf16, and the cache benchmarks ran on the trained checkpoints. Every number in
-this README is measured. Nothing is projected.
+The 7-day plan is finished. The data pipeline, causal attention, RoPE, the loss,
+validation, checkpoint/resume, the sparse Top-2 MoE and the KV cache are all
+verified. The MoE is checked against a dense all-experts oracle on its outputs
+and its gradients. The cache is checked against an uncached forward pass, in the
+test suite and again in fp32 on the trained models. Resume is verified on an
+A100 as well as on CPU. Both full 20M-token runs finished on the same A100 in bf16, and
+the cache benchmarks ran on the trained checkpoints. Every number below came off
+a run.
 
 ## Setup
 
@@ -54,19 +54,19 @@ python -m story_moe.benchmark --checkpoint checkpoints/train_moe/latest.pt --pre
 pytest -q
 ```
 
-`train.device` defaults to `cuda`; pass `--device cpu` to run anywhere. The run
+`train.device` defaults to `cuda`. Pass `--device cpu` to run anywhere. The run
 refuses to start if the GPU does not match `train.require_gpu_name`, or if the
 requested precision is unsupported. Colab reassigns accelerators between
 sessions, and a dense/MoE pair split across two of them is not comparable.
 
-Overrides that do not need a config edit: `--device`, `--precision`,
+These overrides save a config edit. On `train`, `--device`, `--precision`,
 `--require-gpu-name`, `--out-dir`, `--data-cache`, `--max-tokens`,
-`--max-updates`, `--resume` on `train`; `--cache-dir`, `--train-stories`,
-`--val-stories` on `data prepare`.
+`--max-updates` and `--resume`. On `data prepare`, `--cache-dir`,
+`--train-stories` and `--val-stories`.
 
 ## Running on Colab
 
-`notebooks/story_moe_colab.ipynb` sets up and launches; it contains no model code.
+`notebooks/story_moe_colab.ipynb` sets up and launches. It holds no model code.
 
 Code reaches Colab through GitHub:
 
@@ -75,10 +75,9 @@ Code reaches Colab through GitHub:
 !cd /content/story_moe && pip install -e . --no-deps
 ```
 
-The notebook's clone cell also carries a token-based path, left over from when
-this repo was private. It is unnecessary now: a public clone needs no
-credential. Skip the `GH_TOKEN` setup unless you have forked to a private repo
-of your own.
+The notebook's clone cell also carries a token-based path left over from when
+this repo was private. A public clone needs no credential, so skip the
+`GH_TOKEN` setup unless you have forked to a private repo of your own.
 
 Colab behaves differently from the other environments in three ways:
 
@@ -88,7 +87,7 @@ Colab behaves differently from the other environments in three ways:
   so `pyproject.toml` cannot pull torch in.
 - The VM's disk is deleted when the session ends, and sessions end on their own.
   Checkpoints and the token cache go to mounted Drive via `--out-dir` and
-  `--data-cache`; `--resume` picks the run back up from there.
+  `--data-cache`, and `--resume` picks the run back up from there.
 - Pin the accelerator. The notebook's first cell prints the GPU name and whether
   bf16 is supported, then tells you what to pass for `--require-gpu-name` and
   `--precision`. Use the same pair for the dense and the MoE run, and record it.
@@ -108,7 +107,7 @@ Measured caches, both with the GPT-2 tokenizer and stride equal to block_size:
 | experiment, T=512 | validation | 2,000 | 854 | 437,459 | 210 | 437,248 |
 
 The validation row's unique-token count is derived from the block count and the
-discarded remainder rather than read off the log; the same arithmetic reproduces
+discarded remainder rather than read off the log. The same arithmetic reproduces
 the train row's reported 20,152,860 exactly.
 
 That is 226 tokens per story in the debug cache and 223.9 in the experiment
@@ -124,13 +123,13 @@ Fixed for both models. Changing any of it invalidates the comparison.
 | Dataset | `roneneldan/TinyStories`, official train / validation splits |
 | Tokenizer | pretrained GPT-2 (`AutoTokenizer.from_pretrained("gpt2")`), no custom BPE |
 | Special tokens | `add_special_tokens=False`, then exactly one EOS appended per story |
-| Padding | none; there is no pad token and no padded batch |
+| Padding | none, and there is no pad token |
 | Packing | stories concatenated per split, cut into windows of `block_size + 1` |
 | Stride | `block_size` (default), so consecutive windows share one boundary token |
 | Sampling | shuffled permutation per epoch, without replacement |
 | Shift | `inputs = window[:-1]`, `targets = window[1:]` |
-| Remainder | discarded, never padded, never scored; count recorded in `data/cache/<split>.json` |
-| Story boundaries | attention crosses them inside a block; EOS does not reset attention |
+| Remainder | discarded, never padded, never scored. Count recorded in `data/cache/<split>.json` |
+| Story boundaries | attention crosses them inside a block, and EOS does not reset attention |
 
 Subset selection is `random.Random(seed).sample(...)`, and the selected index
 list, its hash, the split size and the tokenizer fingerprint are all written to
@@ -143,35 +142,37 @@ keys only, LayerNorm, GELU experts, tied input/output embeddings, bias-free
 linear projections. The feed-forward sublayer is either a dense MLP or four
 experts with Top-2 routing and a renormalized softmax gate.
 
-The MoE computes only the experts a token selected: each expert's assigned rows
+The MoE computes only the experts a token selected. Each expert's assigned rows
 are gathered, run through one MLP call, weighted, and scatter-added back. Over
-N tokens that is k*N token-expert evaluations, not E*N. A dense all-experts
-version exists solely as a test oracle.
+N tokens that is k*N token-expert evaluations rather than E*N. A dense
+all-experts version exists solely as a test oracle.
 
 The balancing objective is a Top-k adaptation of the Switch loss. `f_e` is
 expert e's share of the k*N assignments, `P_e` the mean full softmax probability,
-and `L = E * sum_e f_e * P_e`. Under uniform routing this equals 1, not 0, so it
-should never be driven toward zero. A value of 1 is also no evidence that routing
-is balanced; see "Reading the routing diagnostics" below. Gradients reach the
-router through `P_e` (the probabilities before top-k truncation) and through the
-renormalized selected weights, which are never detached. The top-k indices
-themselves are discrete and carry no gradient.
+and `L = E * sum_e f_e * P_e`. Under uniform routing this equals 1 rather than
+0, so driving it toward zero is the wrong target. A value of 1 is also no
+evidence that routing is balanced, for reasons in "Reading the routing
+diagnostics" below. Gradients reach the router through `P_e`, the probabilities
+before top-k truncation, and through the renormalized selected weights, which
+are never detached. The top-k indices are discrete and carry no gradient.
 
 Position comes from RoPE alone. There is no learned positional embedding table.
-Attention masking uses `j <= past_len + i` in its general form from the start, so
-enabling the KV cache changes the arguments and not the masking logic.
+Attention masking uses `j <= past_len + i` in its general form from the start,
+so enabling the KV cache changed the arguments and left the masking logic
+alone.
 
 ### Parameter accounting
 
 With the GPT-2 vocabulary (50,257) the tied embedding dominates a small model,
 so report both the total and the non-embedding ("body") count. Neither
-substitutes for the other: the total is what a reader means by "model size",
+substitutes for the other. The total is what a reader means by "model size",
 while the body is what differs between the two architectures. RoPE contributes
 no parameters, so "embedding" is exactly the tied token embedding.
 
-The debug dense row is confirmed against an instantiated model: `body = 394,496`
-= 131,072 attention + 262,144 MLP + 1,280 LayerNorm, and `embedding = 6,432,896`
-= 50,257 × 128. The other rows are computed from config shapes.
+The debug dense row is confirmed against an instantiated model. `body = 394,496`
+is 131,072 attention plus 262,144 MLP plus 1,280 LayerNorm, and
+`embedding = 6,432,896` is 50,257 × 128. The other rows are computed from config
+shapes.
 
 | Config | Embedding | Attention | MLP / experts | Total | Embedding share |
 | --- | --- | --- | --- | --- | --- |
@@ -180,22 +181,23 @@ The debug dense row is confirmed against an instantiated model: `body = 394,496`
 | Experiment dense (6L, D=384, m=4096) | 19.30M | 3.54M | 18.87M | 41.72M | 46% |
 | Experiment MoE (6L, D=384, 4×m=2048) | 19.30M | 3.54M | 37.75M | 60.60M | 32% |
 
-All four rows are now confirmed against instantiated models. Exact counts:
-debug dense 6,827,392 total and 394,496 body; debug MoE 7,090,560 and 657,664;
-experiment dense 41,721,984 and 22,423,296; experiment MoE 60,605,568 and
-41,306,880. The debug MoE body reproduces as 131,072 attention + 524,288 experts
-+ 1,280 LayerNorm + 1,024 router.
+All four rows are confirmed against instantiated models. Exact counts, as total
+and body. Debug dense 6,827,392 and 394,496. Debug MoE 7,090,560 and 657,664.
+Experiment dense 41,721,984 and 22,423,296. Experiment MoE 60,605,568 and
+41,306,880. The debug MoE body reproduces as 131,072 attention plus 524,288
+experts plus 1,280 LayerNorm plus 1,024 router.
 
 The debug tier is a plumbing demonstration. Counting forward matmul FLOPs per
-token (output projection `2VD`; attention projections `2·4D²L`; the QK^T and AV
-matmuls `2·2TDL`; MLP `2·2DmL`), the debug tier spends 93.3% on the tied output
-projection, 3.8% on the MLP and 2.9% on attention. The feed-forward change
-therefore touches under 4% of the compute, and the two models differ by only
-3.8% in total parameters. At the experiment tier the split is 43.8% output
-projection, 42.8% MLP and 13.4% attention, so the MoE swap touches over 40% of
-the forward cost. The main experiment runs at 6 layers and d_model 384:
-`configs/train_dense.yaml` and `configs/train_moe.yaml`, 41.72M against 60.60M
-parameters, bodies 22.42M against 41.30M.
+token, with the output projection at `2VD`, the attention projections at
+`2·4D²L`, the QK^T and AV matmuls at `2·2TDL` and the MLP at `2·2DmL`, the debug
+tier spends 93.3% on the tied output projection, 3.8% on the MLP and 2.9% on
+attention. The feed-forward change therefore touches under 4% of the compute,
+and the two models differ by 3.8% in total parameters. At the experiment tier
+the split is 43.8% output projection, 42.8% MLP and 13.4% attention, so the MoE
+swap touches over 40% of the forward cost. That is why the main experiment runs
+at 6 layers and d_model 384, in `configs/train_dense.yaml` and
+`configs/train_moe.yaml`, at 41.72M against 60.60M parameters with bodies of
+22.42M against 41.30M.
 
 ### Measured throughput
 
@@ -209,20 +211,20 @@ cumulative, measured over the later updates of each probe.
 | Experiment MoE, microbatch 8, T=512 | bf16 | 60,800 | 4,642 MiB |
 | Debug tier, microbatch 4, T=128, CPU (Windows) | fp32 | 2,200 to 2,600 | n/a |
 
-Two things fall out of this. The MoE is 2.01 times slower per token than the
-dense model at the same tier, which is the gather and scatter dispatch cost and
-is why the spec warns against assuming a speedup. At 20M tokens that predicted
-2.7 minutes for the dense run against 5.5 minutes for the MoE. The full runs came
-in at 3.2 and 6.1 minutes, a ratio of 1.87, the difference being validation
-passes and checkpoint writes that the probes did not include.
+The MoE is 2.01 times slower per token than the dense model at the same tier.
+That cost is the gather and scatter dispatch, and it is why the spec warns
+against assuming a speedup. At 20M tokens it predicted 2.7 minutes for the dense
+run against 5.5 minutes for the MoE. The full runs came in at 3.2 and 6.1
+minutes, a ratio of 1.87. The gap is validation passes and checkpoint writes
+that the probes did not include.
 
 The experiment tier also runs 2.2 times faster per token than the debug tier
 despite six times the compute, because the larger tensors use the GPU better.
 Peak memory is 11% of the card, so microbatch 8 still leaves headroom.
 
 Marginal rate within each probe was flat to within 1%. Colab runs torch
-2.11.0+cu128 and the Windows venv runs 2.14.0, so any number quoted has to say
-which produced it.
+2.11.0+cu128 and the Windows venv runs 2.14.0, so any number quoted here names
+the one that produced it.
 
 ## Comparison protocol
 
@@ -231,10 +233,10 @@ precision, effective batch, and processed-token budget. Both models trained from
 scratch. `tests/test_config.py` enforces that the two YAML files differ only in
 the feed-forward fields.
 
-Default matching is approximate active-MLP compute: with expert width `m` and
-Top-2, dense width is `2*m`. This matches selected MLP arithmetic per token; it
-is not equal runtime and not equal full-model FLOPs. The MoE still stores four
-experts. Router and dispatch overhead are extra.
+Default matching is approximate active-MLP compute. With expert width `m` and
+Top-2, dense width is `2*m`, which matches the selected MLP arithmetic per
+token. It does not match runtime or full-model FLOPs. The MoE still stores four
+experts, and router and dispatch overhead are extra.
 
 Because Colab reassigns accelerators between sessions, `train.device`,
 `train.precision` and `train.require_gpu_name` are asserted at startup. A dense
@@ -247,8 +249,8 @@ at each epoch boundary. With `torch.randint`, which samples with replacement,
 drawing n batches' worth from n blocks reaches only `1 - (1-1/n)^n ≈ 63%` of
 them, so a budget described as "one pass" would leave a third of the data unseen
 while showing other blocks twice. With a permutation, "0.98 passes" means 98% of
-blocks, each exactly once. The sampler's permutation, cursor and epoch are saved
-in every checkpoint, so a resume continues from the same position instead of
+blocks, each seen once. The sampler's permutation, cursor and epoch are saved in
+every checkpoint, so a resume continues from where it stopped instead of
 reshuffling.
 
 ## Reading the routing diagnostics
@@ -272,19 +274,19 @@ roughly step 200 the fractions sit in a stable band with max/min between 1.27 an
 1.32, and no expert falls below 0.21. Nothing starved and nothing collapsed.
 
 Two caveats on reading that table. The fractions are a layer average, so a layer
-skewed one way and a layer skewed the other would partly cancel; per-layer
-statistics are collected but only the average is written to the log. And a
-balanced router is not by itself evidence of expert specialization, which this
-project does not claim to have measured.
+skewed one way and a layer skewed the other would partly cancel. Per-layer
+statistics are collected, but only the average reaches the log. Separately, a
+balanced router says nothing about whether the experts specialized, and this
+project has not measured that.
 
-`assignment_fraction` is the balance diagnostic. The auxiliary loss is a poor
-one: with `L = E · Σ f_e P_e`, near-uniform probabilities `P_e ≈ 1/E` give
+Read `assignment_fraction` for balance. The auxiliary loss is a poor substitute.
+With `L = E · Σ f_e P_e`, near-uniform probabilities `P_e ≈ 1/E` give
 `L = E · (1/E) · Σ f_e = 1` for any assignment distribution at all, including
 total collapse onto one expert. An untrained router has near-uniform
-probabilities, so an auxiliary loss sitting at 1.0 early in training carries
-almost no information about load balance. The full run bears this out from the
-other side: `aux` moved over a range of about 0.04 across 1,220 updates while the
-assignment fractions moved visibly, so it was never the thing to watch.
+probabilities, so an auxiliary loss sitting at 1.0 early in training says almost
+nothing about load balance. The full run shows the same thing from the other
+side. `aux` moved over a range of about 0.04 across 1,220 updates while the
+assignment fractions moved visibly.
 
 ## Results
 
@@ -305,8 +307,8 @@ and every validation pause, so it is lower than the marginal rates in the
 throughput table above. Wall clock was 195 s for the dense run and 364 s for the
 MoE run.
 
-The MoE is ahead by 0.071 nats, which is 6.9% lower perplexity. It leads at every
-validation point, not just at the end:
+The MoE is ahead by 0.071 nats, or 6.9% lower perplexity, and it leads at all
+seven validation points rather than only the last one.
 
 | Step | Dense ppl | MoE ppl |
 | --- | --- | --- |
@@ -318,14 +320,14 @@ validation point, not just at the end:
 | 1199 | 10.79 | 10.06 |
 | 1219 | 10.77 | 10.03 |
 
-What this does and does not show. It is a matched-token, matched-data,
-matched-hardware comparison, and under those conditions the sparse model wins.
-It is not a compute-matched or parameter-matched win: the MoE carries 1.84 times
-the body parameters and took 1.87 times the wall clock. Active MLP arithmetic per
-token is matched by construction (`dense_width = 2 * expert_width` under Top-2),
-which is the protocol stated above, but that is one specific notion of "fair" and
-a reader should know which one is being used. Neither curve has flattened at 0.99
-passes, so these are the numbers at this budget, not converged numbers.
+The comparison holds tokens, data and hardware fixed, and under those conditions
+the sparse model wins. It does not hold compute or parameters fixed. The MoE
+carries 1.84 times the body parameters and took 1.87 times the wall clock.
+Active MLP arithmetic per token is matched by construction, since
+`dense_width = 2 * expert_width` under Top-2, and that is the protocol stated
+above. It is one particular notion of a fair comparison, and a reader should
+know which one is in use. Neither curve has flattened at 0.99 passes, so these
+are the numbers at this budget rather than converged numbers.
 
 ### Probe runs, not results
 
@@ -346,27 +348,26 @@ compare against each other.
 
 ### KV cache
 
-Correctness first, because a speedup from a wrong cache is worth nothing.
+A speedup from a wrong cache is worth nothing, so correctness comes first.
 
-The cache is a mathematical identity, so it is verified in fp32, where the
-arithmetic is precise enough to test one. Across all 22 grid points below, the
-cached and uncached paths decoded identical tokens in fp32, and a lockstep
-comparison feeding both paths the same tokens put the largest logit difference
-at **2.1e-5 on logits of magnitude 16**, a relative difference of about 1e-6.
-That is floating-point reassociation, which is what an identity computed two
-ways is supposed to look like.
+The cache is a mathematical identity, and fp32 is where the arithmetic is
+precise enough to test one. Across all 22 grid points below, the cached and
+uncached paths decoded identical tokens in fp32. A lockstep comparison feeding
+both paths the same tokens put the largest logit difference at 2.1e-5 against
+logits of magnitude 16, a relative difference of about 1e-6. That is
+floating-point reassociation, which is how an identity computed two ways should
+look.
 
-In bf16 the two paths sometimes decode different tokens, and that is a property
-of bf16 rather than of the cache. The lockstep logit difference in bf16 is
-0.0625 at batch 1, which is exactly one unit in the last place at that magnitude
-(bf16 carries 8 mantissa bits, so near 15 the spacing is 2^3 * 2^-8 = 0.0625).
-Greedy argmax is a discontinuous function of the logits, so a one-ULP difference
-flips the choice whenever the top two candidates are closer together than that,
-and several of the recorded flips happened at a measured top-2 gap of exactly
-0.0, meaning two tokens with identical bf16 logits. One flipped token then makes
-every later token differ. The benchmark therefore fails only on an fp32
-mismatch, and reports bf16 token divergence alongside the logit deltas that
-explain it.
+In bf16 the two paths sometimes decode different tokens. That is a property of
+bf16 and not of the cache. The lockstep logit difference in bf16 is 0.0625 at
+batch 1, exactly one unit in the last place at that magnitude, since bf16 carries
+8 mantissa bits and the spacing near 15 is 2^3 * 2^-8 = 0.0625. Greedy argmax is
+a discontinuous function of the logits, so a one-ULP difference flips the choice
+whenever the top two candidates sit closer together than that. Several of the
+recorded flips happened at a measured top-2 gap of exactly 0.0, meaning two
+tokens with identical bf16 logits. One flipped token then makes every later token
+differ. The benchmark therefore fails only on an fp32 mismatch, and reports bf16
+token divergence alongside the logit deltas that explain it.
 
 Timings, `NVIDIA A100-SXM4-40GB`, bf16, torch 2.11.0+cu128, median of 5 trials
 after 2 warmup, decode cost excluding prefill:
@@ -378,63 +379,61 @@ after 2 warmup, decode cost excluding prefill:
 | Dense | 1 | 256 | 256 | 9.14 | 7.97 | 8.13 | 1.02x | 252 MiB | 265 MiB |
 | Dense | 32 | 64 | 64 | 9.38 | 8.09 | 8.02 | 0.99x | 295 MiB | 335 MiB |
 | Dense | 32 | 128 | 128 | 9.22 | 8.33 | 8.34 | 1.00x | 362 MiB | 414 MiB |
-| Dense | 32 | 256 | 256 | 9.73 | 8.39 | 15.19 | **1.81x** | 517 MiB | 815 MiB |
+| Dense | 32 | 256 | 256 | 9.73 | 8.39 | 15.19 | 1.81x | 517 MiB | 815 MiB |
 | MoE | 1 | 8 | 8 | 17.25 | 12.38 | 17.69 | 1.43x | 361 MiB | 361 MiB |
 | MoE | 1 | 256 | 256 | 19.32 | 13.94 | 17.63 | 1.26x | 365 MiB | 379 MiB |
 | MoE | 32 | 64 | 64 | 19.62 | 17.52 | 17.60 | 1.00x | 409 MiB | 423 MiB |
 | MoE | 32 | 128 | 128 | 19.39 | 17.53 | 17.86 | 1.02x | 466 MiB | 532 MiB |
-| MoE | 32 | 256 | 256 | 19.99 | 17.64 | 25.90 | **1.47x** | 615 MiB | 936 MiB |
+| MoE | 32 | 256 | 256 | 19.99 | 17.64 | 25.90 | 1.47x | 615 MiB | 936 MiB |
 
 The headline speedup is 1.81x dense and 1.47x MoE, at batch 32 with 512 tokens
 of context. The full grid is in `results/bench_*.json`.
 
-This is a smaller and stranger result than the theory predicts, and the reason
-is the most useful thing the benchmark found.
+Theory predicts a larger and steadier win than that, and working out why it did
+not appear turned out to be the most useful thing the benchmark produced. Decode
+at this model size is bound by launch overhead rather than by arithmetic. The
+cached column barely moves. Dense cached decode costs 7.05 ms/token with 16
+tokens of context, 7.97 ms/token with 512, and 8.39 ms/token at batch 32, where
+each step produces 32 tokens instead of one. That is thirty-two times the work
+for 5% more time. Prefill shows it more starkly still, at 9.35 ms for 8 tokens
+and 9.73 ms for 8,192 (batch 32, prompt 256). What those numbers measure is
+Python dispatch and CUDA launch for roughly a hundred small kernels per step. A
+41M-parameter model on an A100 has too little arithmetic per step to surface
+above that.
 
-**Decode at this model size is bound by launch overhead, not by arithmetic.**
-Read the cached column: it barely moves. Dense cached decode costs 7.05 ms/token
-with 16 tokens of context and 7.97 ms/token with 512, and 8.39 ms/token at batch
-32, where each step produces 32 tokens instead of one. Thirty-two times the work
-for 5% more time. Prefill says the same thing louder: 9.35 ms for 8 tokens and
-9.73 ms for 8,192 (batch 32, prompt 256). What is being measured below those
-numbers is Python dispatch and CUDA launch for roughly a hundred small kernels
-per step, and a 41M-parameter model on an A100 does not have enough arithmetic
-per step to surface above it.
+The floor is about 8 ms per decode step dense and 18 ms MoE. The uncached path
+costs the same as the cached path until its recomputation grows past the floor,
+which is why the speedup sits near 1.0x everywhere except the two largest
+points. At batch 1 the crossover never arrives anywhere in a 512-token context.
+At batch 32 it lands between 256 and 512 tokens. At 256 tokens of context the
+uncached path still costs 8.02 ms, and at 512 it costs 15.19.
 
-That sets a floor of about 8 ms per decode step dense and 18 ms MoE. The
-uncached path costs the same as the cached path until its recomputation grows
-past that floor, which is why the speedup is ~1.0x everywhere except the two
-largest points. At batch 1 the crossover is never reached anywhere in a
-512-token context. At batch 32 it lands between 256 and 512 tokens: at 256 total
-context the uncached path still costs 8.02 ms, and at 512 it costs 15.19.
+Three consequences are worth drawing out.
 
-Three things follow, none of which is "the cache does not work":
-
-- The cache's benefit is bounded by the fraction of a step that is real GPU
-  work. That fraction rises with model size, batch size and context length, and
-  this model is small on all three axes.
-- MoE shows a larger speedup than dense at batch 1 (1.26x to 1.43x against 1.02x
-  to 1.17x) for the same reason in reverse: gather, four experts and scatter put
+- The cache can only save the fraction of a step that is real GPU work. That
+  fraction rises with model size, batch size and context length, and this model
+  is small on all three axes.
+- MoE shows a larger speedup than dense at batch 1, 1.26x to 1.43x against 1.02x
+  to 1.17x, for the same reason inverted. Gather, four experts and scatter put
   more arithmetic under the same overhead, so removing it matters more.
-- Batching is the larger lever here. Dense cached decode goes from 125 tokens/s
-  at batch 1 to 3,814 tokens/s at batch 32, a 30x improvement from the same
-  cache, because batching is what turns an overhead-bound step into a
-  compute-bound one.
+- Batching is the bigger lever. Dense cached decode goes from 125 tokens/s at
+  batch 1 to 3,814 tokens/s at batch 32, a 30x improvement from the same cache,
+  since batching is how a step becomes compute-bound at all.
 
-The memory prediction held. At batch 32 with 512 tokens of context the cached
-path peaks at 517 MiB against the uncached path's 815 MiB, and the MoE at 615
-against 936, even though only the cached path stores keys and values. The
+The memory prediction did hold. At batch 32 with 512 tokens of context the
+cached path peaks at 517 MiB against the uncached path's 815 MiB, and the MoE at
+615 against 936, even though only the cached path stores keys and values. The
 uncached path materializes a `[32, 6, t, t]` score matrix at every step, which
 costs more than the cache it avoids.
 
-A caveat on scope: every number here is one model at one size on one GPU. The
-overhead floor is a property of that combination, not of KV caching.
+All of this is one model at one size on one GPU. The overhead floor belongs to
+that combination and not to KV caching in general.
 
 ### What the model writes
 
-Trained weights are not distributed with this repo. They are roughly 500 MB each
+Trained weights are not distributed with this repo. They run about 500 MB each
 with the optimizer state, and a checkpoint in Git history cannot be removed
-cleanly later. Reproducing them is cheap: the two runs below took 195 and 364
+cleanly later. Reproducing them is cheap. The two runs below took 195 and 364
 seconds on an A100, and every setting that determines them lives in
 `configs/train_dense.yaml` and `configs/train_moe.yaml`.
 
@@ -463,14 +462,14 @@ python -m story_moe.generate --checkpoint <ckpt>/train_moe/latest.pt \
 >
 > Lily was happy that the ball was safe and the new ball would come back
 
-Read it for what it is. The syntax is sound: agreement, tense, clause structure
-and the TinyStories register are all there, and the model holds a character name
-across 120 tokens. The discourse is not. Mommy says they can keep the ball and
-then says it is not a good idea; "it was not nice for" stops mid-phrase; the
-last line asserts something no earlier line set up. That is the expected shape
-for 41M parameters at 0.99 passes over 20M tokens, and it is the reason
-perplexity 10.03 should be read as "better than 10.77 under an identical
-protocol" and not as a claim about quality.
+The syntax holds up. Agreement, tense and clause structure are sound, the
+TinyStories register is right, and the model keeps a character name across 120
+tokens. The discourse falls apart. Mommy says they can keep the ball and then
+says it is not a good idea, "it was not nice for" stops mid-phrase, and the last
+line asserts something no earlier line set up. This is the expected shape for
+41M parameters at 0.99 passes over 20M tokens. It is also why perplexity 10.03
+means "better than 10.77 under an identical protocol" and carries no claim about
+quality.
 
 ## Limitations
 
@@ -481,9 +480,9 @@ protocol" and not as a claim about quality.
   perplexity relative to protocols that carry context across windows. Both
   models use the identical protocol, so the comparison is still fair, but the
   number is not comparable to a published result.
-- RoPE here rotates adjacent even/odd feature pairs (the GPT-J / interleaved
-  convention). HuggingFace Llama and GPT-NeoX rotate halves `(i, i+Dh/2)`
-  instead. Both are valid; a direct tensor comparison against those
+- RoPE here rotates adjacent even/odd feature pairs, the GPT-J or interleaved
+  convention. HuggingFace Llama and GPT-NeoX rotate halves `(i, i+Dh/2)`
+  instead. Both are valid, but a direct tensor comparison against those
   implementations will not match.
 - No target perplexity, speedup, or parameter count is promised.
 
@@ -495,8 +494,8 @@ MIT. See `LICENSE`.
 
 - TinyStories dataset: https://huggingface.co/datasets/roneneldan/TinyStories
 - RoFormer / RoPE: https://arxiv.org/abs/2104.09864
-- Switch Transformers (balancing loss, originally Top-1; adapted here to Top-2):
-  https://arxiv.org/abs/2101.03961
+- Switch Transformers, the balancing loss, originally Top-1 and adapted here to
+  Top-2: https://arxiv.org/abs/2101.03961
 - Mixtral of Experts (token-wise Top-2 selection): https://arxiv.org/abs/2401.04088
 - PyTorch SDPA mask/dropout semantics:
   https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html

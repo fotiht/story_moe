@@ -31,7 +31,7 @@ def test_mask_with_no_past_is_lower_triangular():
 
 
 def test_mask_with_past_allows_all_cached_keys():
-    # 2 new queries after 3 cached tokens: query 0 is position 3, query 1 is 4.
+    # 2 new queries after 3 cached tokens, so query 0 is position 3 and query 1 is 4.
     mask = offset_causal_mask(2, 5, past_len=3, device=torch.device("cpu"))
     expected = torch.tensor(
         [[True, True, True, True, False],
@@ -41,7 +41,7 @@ def test_mask_with_past_allows_all_cached_keys():
 
 
 def test_single_token_decode_sees_everything():
-    """One new query after P cached tokens excludes nothing -- every key is its past."""
+    """One new query after P cached tokens excludes nothing. Every key is its past."""
     mask = offset_causal_mask(1, 9, past_len=8, device=torch.device("cpu"))
     assert mask.all()
 
@@ -67,7 +67,7 @@ def test_loss_is_computed_and_separated_from_aux(model):
 
 
 def test_untrained_loss_is_near_log_vocab(model):
-    """The cheapest bug detector there is: a uniform predictor scores ln(V)."""
+    """The cheapest bug detector there is. A uniform predictor scores ln(V)."""
     x = torch.randint(0, VOCAB, (4, 16))
     y = torch.randint(0, VOCAB, (4, 16))
     loss = model(x, targets=y).lm_loss.item()
@@ -84,7 +84,7 @@ def test_mismatched_target_shape_rejected(model):
 
 
 def test_future_tokens_do_not_change_earlier_logits(model):
-    """Rewrite the suffix; every logit at or before the cut must be unchanged."""
+    """Rewrite the suffix. Every logit at or before the cut must be unchanged."""
     torch.manual_seed(1)
     x = torch.randint(0, VOCAB, (2, 16))
     cut = 9
@@ -132,7 +132,7 @@ def test_tied_weights_counted_once():
 
 
 def test_moe_and_dense_share_everything_but_the_feedforward():
-    """Only the feed-forward slot may differ; see tests/test_moe.py for the rest."""
+    """Only the feed-forward slot may differ. See tests/test_moe.py for the rest."""
     dense = StoryLM(tiny_cfg())
     sparse = StoryLM(tiny_cfg(use_moe=True, n_experts=4, top_k=2, expert_width=48))
 

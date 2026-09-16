@@ -1,8 +1,8 @@
-"""Day 7: what the KV cache actually buys, measured.
+"""What the KV cache actually buys, measured.
 
 The claim being tested is narrow. The cache changes no arithmetic, so it cannot
-change what the model says; it changes how much of that arithmetic is repeated.
-At generated position t:
+change what the model says. What it changes is how much of that arithmetic is
+repeated. At generated position t:
 
     uncached step   re-runs the whole network over all t tokens
                     ~ O(t * D^2)  projections and MLP
@@ -11,25 +11,25 @@ At generated position t:
                     ~ O(D^2)      projections and MLP
                     + O(t * D)    attention against t stored keys
 
-So the saving is not mainly in attention. It is that the uncached path re-runs
-every projection, every expert and the output head over the entire prefix, every
+Most of the saving is not in attention. The uncached path re-runs every
+projection, every expert and the output head over the entire prefix, at every
 step.
 
-That predicts a speedup growing with sequence length. The measured answer is
-more interesting, and it is written here because the prediction was wrong. A
-decode step at this model size has a floor of roughly 8 ms (dense) or 18 ms
-(MoE) on an A100 that is pure Python dispatch and kernel-launch overhead, and
-the saved arithmetic is invisible underneath it. The uncached path costs the
-same as the cached path until its recomputation grows past that floor. At batch
-1 it never does, anywhere in a 512-token context; at batch 32 the crossover
-lands between 256 and 512 tokens of context. Below the crossover the cache buys
-nothing measurable. Above it the saving is real and grows.
+That predicts a speedup growing with sequence length. The prediction was wrong.
+Here is what the measurement showed. A decode step at this model size has
+a floor of roughly 8 ms (dense) or 18 ms (MoE) on an A100 that is pure Python
+dispatch and kernel-launch overhead, and the saved arithmetic is invisible
+underneath it. The uncached path costs the same as the cached path until its
+recomputation grows past that floor. At batch 1 it never does, anywhere in a
+512-token context. At batch 32 the crossover lands between 256 and 512 tokens of
+context. Below the crossover the cache buys nothing measurable. Above it the
+saving is real and grows.
 
-The memory prediction did hold: the cached path peaks LOWER despite storing
+The memory prediction did hold. The cached path peaks LOWER despite storing
 keys, because the uncached path materializes a [B, H, t, t] score matrix every
 step.
 
-Honesty notes baked into the numbers below:
+How the numbers are taken:
 
   - Every timed region is bracketed by torch.cuda.synchronize(). CUDA launches
     are asynchronous, and timing without it measures how fast Python can queue
@@ -38,9 +38,10 @@ Honesty notes baked into the numbers below:
     and kernel selection costs that no later call pays.
   - The median of repeated trials is reported, not the mean. One Colab
     preemption blip skews a mean and leaves a median alone.
-  - Both modes decode greedily and the tokens are compared. A benchmark whose
-    two sides compute different things measures nothing, so that comparison is
-    an assertion, not a footnote.
+  - Before timing anything, both modes decode greedily in fp32 and their tokens
+    must match, or the run aborts. The check runs in fp32 rather than at the
+    timed precision because greedy argmax is discontinuous. In bf16 a one-ULP
+    logit difference flips a near-tie, which says nothing about the cache.
 """
 
 from __future__ import annotations
@@ -49,48 +50,14 @@ import argparse
 import json
 import statistics
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 
-from .config import Config, config_from_dict
 from .generate import GenerationConfig, generate
 from .model import StoryLM, count_parameters
-
-
-def load_for_inference(
-    ckpt_path: str | Path, device: str, precision: str | None = None
-) -> tuple[StoryLM, Config, dict[str, Any]]:
-    """Rebuild the trained model from a checkpoint, in eval mode.
-
-    The config comes from inside the checkpoint, so the shapes are the ones the
-    weights were trained with and a since-edited YAML cannot cause a silent
-    mismatch.
-    """
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = config_from_dict(payload["config"])
-    if precision is not None:
-        cfg.train.precision = precision
-
-    model = StoryLM(cfg)
-    model.load_state_dict(payload["model"])
-    model.to(device).eval()
-    meta = {
-        "step": payload.get("step"),
-        "processed_tokens": payload.get("processed_tokens"),
-        "best_val_nll": payload.get("best_val_nll"),
-        "tokenizer": payload.get("tokenizer"),
-    }
-    return model, cfg, meta
-
-
-def autocast_for(device: str, precision: str) -> Callable[[], Any]:
-    if not device.startswith("cuda") or precision == "fp32":
-        return nullcontext
-    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    return lambda: torch.autocast("cuda", dtype=dtype)
+from .train import autocast_for, load_for_inference
 
 
 def _sync(device: str) -> None:
@@ -132,19 +99,19 @@ def lockstep_compare(
     """Step both paths on IDENTICAL tokens and compare their logits directly.
 
     Free-running greedy decode answers "do the two paths produce the same
-    story", but it answers it badly: one differing token at step 40 makes every
+    story", but it answers it badly. One differing token at step 40 makes every
     later token differ too, so a single disagreement looks like total failure
     and there is no way to see how big the underlying numerical difference was.
 
     Here both paths are fed the same token every step, chosen by the cached
-    path. That isolates per-step disagreement from cumulative drift and lets the
-    question become quantitative: how far apart are the logits, and when argmax
+    path. That isolates per-step disagreement from cumulative drift, so the
+    question becomes quantitative. How far apart are the logits, and when argmax
     does disagree, how close were the top two candidates?
 
     A real cache bug (wrong RoPE offset, per-layer length skew) produces a large
     logit delta at the FIRST step. Reduced-precision tie-breaking produces a
-    tiny delta that only flips argmax when the top-2 gap is smaller than it.
-    Those two stories are distinguishable, which is the point of measuring.
+    tiny delta that only flips argmax when the top-2 gap is smaller than it. The
+    numbers returned below tell those two apart.
     """
     ids = prompt.clone()
     cache = model.new_cache(max_len=prompt.size(1) + n_steps)
@@ -172,9 +139,9 @@ def lockstep_compare(
             disagreements += 1
             if first is None:
                 # Report the row that actually differs. Reporting row 0 instead
-                # prints a pair of identical tokens whenever the batch is larger
-                # than one and some other row is the one that flipped, which
-                # reads as a broken diagnostic rather than a narrow tie.
+                # prints a pair of identical tokens whenever some other row in
+                # the batch is the one that flipped, which looks like a broken
+                # diagnostic rather than the narrow tie it is.
                 r = int(differing[0].item())
                 top2 = lu[r].topk(2).values
                 first = {
@@ -217,7 +184,7 @@ def benchmark_point(
     """One (prompt, replay) cell of the grid, both modes.
 
     "Replay" is the spec's word for how many tokens are generated after the
-    prompt. Greedy decoding throughout, so the two modes are directly
+    prompt. Decoding is greedy throughout, so the two modes are directly
     comparable and their outputs can be checked against each other.
     """
     vocab = model.cfg.model.vocab_size
@@ -234,13 +201,13 @@ def benchmark_point(
 
     # Correctness first. If these disagree the timings below are meaningless.
     #
-    # The gate runs in fp32, not in the timing precision. The cache is a
+    # The gate runs in fp32 rather than at the timed precision. The cache is a
     # mathematical identity, so it has to be tested where the arithmetic is
     # precise enough to test it. Greedy token equality is a DISCONTINUOUS
-    # function of the logits: under bf16, two candidates within ~1e-2 of each
+    # function of the logits. Under bf16, two candidates within ~1e-2 of each
     # other can swap on a rounding difference, and one swapped token makes every
-    # later token differ. Failing the run on that would be reporting a property
-    # of bf16 as though it were a broken cache.
+    # later token differ. Failing the run on that would report a property of
+    # bf16 as though it were a broken cache.
     fp32 = autocast_for(device, "fp32")
     with fp32():
         agree_fp32 = bool(torch.equal(
@@ -249,8 +216,8 @@ def benchmark_point(
         ))
     lockstep_fp32 = lockstep_compare(model, prompt, min(replay_len, 32), fp32)
 
-    # And the same question at the precision actually being timed, reported
-    # rather than enforced, with the logit deltas that explain the answer.
+    # The same question at the precision actually being timed, reported rather
+    # than enforced, with the logit deltas that explain the answer.
     with amp():
         agree_native = bool(torch.equal(
             generate(model, prompt, gcfg, use_cache=True),
@@ -283,12 +250,11 @@ def benchmark_point(
     uncached_ms, uncached_best = time_median_ms(run_uncached, device, warmup, trials)
     uncached_peak = peak_mib(device)
 
-    # Per-token decode cost excludes prefill, which both modes pay identically:
-    # the cached total includes one prefill, so subtract it before dividing.
+    # Per-token decode cost excludes prefill, which both modes pay identically.
+    # The cached total includes one prefill, so subtract it before dividing.
     # Two separately-timed medians can subtract to something non-positive when
     # the decode work is near timer resolution (short replay on a fast GPU).
-    # That is a measurement too small to report, not a decode that took no time,
-    # so it becomes None rather than a flattering zero or a divide by zero.
+    # Reporting None there avoids both a flattering zero and a divide by zero.
     cached_decode_ms = cached_ms - prefill_ms
     per_token_cached = (
         cached_decode_ms / replay_len if replay_len and cached_decode_ms > 0 else None
@@ -331,7 +297,7 @@ def _cache_reserved_mib(
     2 (keys and values) * layers * B * H * max_len * Dh * bytes_per_element.
 
     The element size follows the precision, because the buffers are allocated
-    from the dtype of the first key tensor written into them: under bf16 or fp16
+    from the dtype of the first key tensor written into them. Under bf16 or fp16
     autocast that is 2 bytes, not 4. Quoting the fp32 figure for a bf16 run
     overstates the cache by exactly a factor of two.
     """
@@ -393,17 +359,17 @@ def _print_precision_note(row: dict[str, Any]) -> None:
 
 
 def _fmt(value: float | None, width: int, places: int) -> str:
-    """Print a missing measurement as n/a instead of inventing a number."""
+    """Format a measurement, printing n/a when there is no number to print."""
     return "n/a".rjust(width) if value is None else f"{value:{width}.{places}f}"
 
 
 def default_grid(max_seq_len: int) -> list[tuple[int, int]]:
     """Points that fit the model's context, chosen to show the trend with length.
 
-    The short points are not filler. The speedup should start near 1x and grow
-    with sequence length, and a grid that only samples long sequences shows the
-    headline number without the trend that explains it. The smallest point also
-    keeps this usable on a short-context model instead of returning nothing.
+    The speedup should start near 1x and grow with sequence length. A grid that
+    only samples long sequences shows the headline number without the trend that
+    explains it. The smallest point keeps this usable on a short-context model,
+    where a longer grid would return nothing at all.
     """
     candidates = [
         (8, 8), (8, 16), (16, 32), (32, 64),

@@ -1,5 +1,5 @@
 # Debug-tier MoE. Identical to debug_dense except the feed-forward sublayer.
-# Diff these two files before any comparison run -- only the `use_moe`,
+# Diff these two files before any comparison run. Only the `use_moe`,
 # `n_experts`, `top_k`, `expert_width`, `aux_loss_weight` and `out_dir` lines
 # should differ.
 name: debug_moe

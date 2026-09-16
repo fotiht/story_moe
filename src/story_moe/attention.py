@@ -1,9 +1,9 @@
 """Multi-head causal self-attention, written out explicitly.
 
 This is the reference implementation: projections, scaled dot product, mask,
-softmax, weighted sum, merge heads, output projection. PyTorch SDPA is faster
-but its mask semantics are easy to get wrong with a cached offset, so it is only
-introduced later and only after matching these numbers.
+softmax, weighted sum, merge heads, output projection. PyTorch SDPA is faster,
+but its mask semantics are easy to get wrong with a cached offset, so it arrives
+later and only once it matches these numbers.
 
 Shapes, tracked at every step:
 
@@ -41,8 +41,8 @@ def offset_causal_mask(
     the full sequence, so it may see every key up to and including itself.
 
     With past_len == 0 and q_len == k_len this is exactly a lower triangle. The
-    general form is written now, rather than a tril, so the KV-cache milestone
-    does not have to replace the masking logic -- only pass a nonzero past_len.
+    general offset form is here from the start so the KV-cache milestone only
+    has to pass a nonzero past_len and can leave the masking logic alone.
     """
     i = torch.arange(q_len, device=device).unsqueeze(1)   # [T_q, 1]
     j = torch.arange(k_len, device=device).unsqueeze(0)   # [1, T_k]
@@ -81,26 +81,21 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        past_len: int = 0,
         cache: KVCache | None = None,
         layer_idx: int = 0,
     ) -> torch.Tensor:
         """[B, T, D] -> [B, T, D].
 
-        With a cache, `past_len` comes from the cache rather than the caller, so
-        there is one source of truth for "how many tokens came before these".
-        The T new tokens are appended and attention scores against every stored
-        position, giving scores [B, H, T, past_len + T].
+        The cache is the only source of "how many tokens came before these".
+        With one, the T new tokens are appended and attention scores against
+        every stored position, giving scores [B, H, T, past_len + T]. Without
+        one, past_len is 0 and this is an ordinary causal forward pass.
         """
         B, T, D = x.shape
         if D != self.d_model:
             raise ValueError(f"expected last dim {self.d_model}, got {D}")
 
-        if cache is not None:
-            if past_len:
-                raise ValueError("pass past_len or a cache, not both")
-            past_len = cache.length
-
+        past_len = cache.length if cache is not None else 0
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))

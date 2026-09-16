@@ -2,21 +2,21 @@
 
 Two rules this module exists to enforce:
 
-  1. **Language loss only.** The MoE balancing term never enters a perplexity.
+  1. Language loss only. The MoE balancing term never enters a perplexity.
      Reporting exp(total_loss) would silently inflate the MoE's number and make
      the comparison meaningless.
-  2. **Token weighting, not batch averaging.** Batches can hold different
-     numbers of scored tokens, so the mean of per-batch losses is not the mean
-     per-token loss. Sum the NLL over every scored target and divide once:
+  2. Token weighting. Batches can hold different numbers of scored tokens, so
+     averaging per-batch losses does not give the mean per-token loss. Sum the
+     NLL in float32 over every scored target, then divide once:
 
          mean_nll   = total_token_nll / scored_token_count
          perplexity = exp(mean_nll)
 
 Each validation window is scored independently with context reset at its start,
 so the first targets in a window are predicted from very little context. That
-inflates perplexity relative to protocols that carry context across windows.
-Both models use the identical protocol, so the comparison stays fair, but the
-number is not comparable to a published result.
+inflates perplexity against protocols that carry context across windows. Both
+models run the identical protocol, so the comparison stays fair. The number
+itself is not comparable to a published result.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def evaluate_blocks(
             ctx = autocast_ctx() if autocast_ctx is not None else nullcontext()
             with ctx:
                 logits = model(x).logits
-            # float32 for the reduction: summing thousands of fp16 terms drifts.
+            # float32 for the reduction. Summing thousands of fp16 terms drifts.
             nll = F.cross_entropy(
                 logits.float().reshape(-1, logits.size(-1)),
                 y.reshape(-1),

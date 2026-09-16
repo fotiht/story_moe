@@ -1,16 +1,14 @@
 """Pre-norm decoder block and the language model.
 
-DAY 6 SCOPE. Attention, the loss, RoPE, the sparse Top-k MoE feed-forward, and
-the KV cache. The temporary learned positional embedding from Day 2 was DELETED,
-not disabled.
+Attention, the loss, RoPE, the sparse Top-k MoE feed-forward, and the KV cache.
+Position comes from RoPE alone. There is no positional embedding table.
 
 Dense and MoE share every line of this file except which module fills the
-feed-forward slot, which is what makes the comparison controlled.
+feed-forward slot, so any measured difference between them comes from that slot.
 
 Parameter accounting: with the GPT-2 vocabulary (50,257) and a small d_model the
 tied embedding dominates the total, so count_parameters() reports embedding and
-body separately. The body number is the one to quote when comparing dense
-against MoE.
+body separately. Quote the body number when comparing dense against MoE.
 """
 
 from __future__ import annotations
@@ -33,10 +31,10 @@ from .rope import rope_tables
 class ModelOutput:
     """Losses are kept separate on purpose.
 
-    lm_loss is the next-token cross-entropy and is the ONLY thing reported as
-    perplexity. aux_loss is the MoE balancing term (0.0 for a dense model).
-    total_loss = lm_loss + aux_weight * aux_loss is what the optimizer sees.
-    Never quote total_loss as a language-modeling result.
+    lm_loss is the next-token cross-entropy and the only one of the three that
+    becomes a reported perplexity. aux_loss is the MoE balancing term (0.0 for a
+    dense model). total_loss = lm_loss + aux_weight * aux_loss is what the
+    optimizer sees. Never quote total_loss as a language-modeling result.
     """
 
     logits: torch.Tensor
@@ -45,7 +43,7 @@ class ModelOutput:
     total_loss: torch.Tensor | None = None
     # The same KVCache object that was passed in, advanced by this call. Handed
     # back so a generation loop can read it off the output instead of keeping a
-    # second reference; it is not a copy.
+    # second reference. It is the same object, not a copy.
     past_key_values: "KVCache | None" = None
     router_stats: list[RouterStats] | None = None  # detached, opt-in
 
@@ -60,7 +58,7 @@ class DecoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(m.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.norm2 = nn.LayerNorm(m.d_model)
-        # The ONLY architectural difference between the two models.
+        # The one architectural difference between the two models.
         self.use_moe = m.use_moe
         self.feed_forward = (
             SparseMoE(cfg) if m.use_moe
@@ -72,15 +70,11 @@ class DecoderBlock(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        past_len: int = 0,
         need_aux: bool = True,
         collect_stats: bool = False,
         cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, RouterStats | None]:
-        x = x + self.attn(
-            self.norm1(x), cos, sin,
-            past_len=past_len, cache=cache, layer_idx=self.layer_idx,
-        )
+        x = x + self.attn(self.norm1(x), cos, sin, cache=cache, layer_idx=self.layer_idx)
         h = self.norm2(x)
         if self.use_moe:
             ff, aux, stats = self.feed_forward(h, need_aux=need_aux, collect_stats=collect_stats)
@@ -103,7 +97,7 @@ class StoryLM(nn.Module):
         self.drop = nn.Dropout(m.dropout)
 
         # Position comes only from RoPE. There is no positional embedding table.
-        # Buffers so .to(device) moves them; non-persistent so they are rebuilt
+        # Buffers so .to(device) moves them. Non-persistent so they are rebuilt
         # from the config on load instead of bloating every checkpoint.
         cos, sin = rope_tables(m.d_head, m.max_seq_len, m.rope_base)
         self.register_buffer("rope_cos", cos, persistent=False)
@@ -145,14 +139,15 @@ class StoryLM(nn.Module):
         """[B, T] -> ModelOutput.
 
         logits_to_keep=k projects only the last k positions, giving [B, k, V].
-        Generation uses k=1; training and evaluation need every position, so
-        passing both targets and logits_to_keep is rejected rather than silently
-        scoring a suffix.
+        Generation uses k=1. Training and evaluation need every position, so
+        passing both targets and logits_to_keep raises instead of scoring a
+        suffix and calling it the loss.
 
-        `cache` makes this an incremental step: input_ids are the NEW tokens
-        only, they are treated as occupying positions cache.length ..
-        cache.length+T-1, and the cache is advanced by T before returning. Pass
-        the whole prompt for prefill and one token per step after that.
+        With `cache`, this is an incremental step. input_ids holds only the
+        tokens that are not in the cache yet. They occupy positions
+        cache.length .. cache.length+T-1, and the cache is advanced by T before
+        returning. Pass the whole prompt for prefill and one token per step
+        after that.
         """
         if input_ids.dtype not in (torch.int64, torch.int32):
             raise TypeError(f"input_ids must be integer dtype, got {input_ids.dtype}")
@@ -178,9 +173,9 @@ class StoryLM(nn.Module):
 
         x = self.drop(self.token_emb(input_ids))
 
-        # The balancing reduction runs only when it can actually be optimized.
-        # Inference and the cache benchmark skip it, so no diagnostic work
-        # separates those paths from each other.
+        # The balancing reduction runs only when it can be optimized. Inference
+        # and the cache benchmark skip it, so no diagnostic work separates those
+        # paths from each other.
         need_aux = targets is not None
         aux_terms: list[torch.Tensor] = []
         stats: list[RouterStats] = []
@@ -248,9 +243,9 @@ class StoryLM(nn.Module):
 def count_parameters(model: nn.Module) -> dict[str, int]:
     """Unique trainable parameters, split into embedding and body.
 
-    Tied weights are counted once: parameters are deduplicated by id() before
+    Tied weights are counted once. Parameters are deduplicated by id() before
     summing, so a tied lm_head does not inflate the total. RoPE contributes no
-    parameters at all, so "embedding" here is exactly the token embedding.
+    parameters, so "embedding" here is exactly the token embedding.
     """
     embedding_ids: set[int] = set()
     for module in model.modules():
@@ -265,7 +260,7 @@ def count_parameters(model: nn.Module) -> dict[str, int]:
 
 
 def expected_initial_loss(vocab_size: int) -> float:
-    """Cross-entropy of a uniform predictor: an untrained model must start here.
+    """Cross-entropy of a uniform predictor. An untrained model starts here.
 
     For GPT-2's 50,257-token vocabulary this is ln(50257) = 10.825. A first-step
     loss far from it means a broken vocab size, a broken shift, or a broken tie.

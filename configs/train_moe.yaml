@@ -1,7 +1,7 @@
 # Main experiment: Top-2 MoE, 6 layers / d_model 384.
 #
 # Identical to train_dense.yaml except the feed-forward sublayer. Diff the two
-# files before every comparison run; tests/test_config.py enforces it.
+# files before every comparison run. tests/test_config.py enforces it.
 name: train_moe
 
 model:
@@ -14,7 +14,7 @@ model:
   n_experts: 4
   top_k: 2
   expert_width: 2048     # dense_width in the baseline is 2 * this
-  dense_width: 4096      # unused here; stated so the recorded config shows the matched pair
+  dense_width: 4096      # unused here, stated so the recorded config shows the matched pair
   aux_loss_weight: 0.01
   rope_base: 10000.0
   dropout: 0.0
@@ -31,7 +31,7 @@ data:
   seed: 1234
   block_size: 512
   stride: null
-  cache_dir: data/cache_512   # NOT the debug cache: different block size
+  cache_dir: data/cache_512   # NOT the debug cache, which has a different block size
 
 train:
   lr: 3.0e-4
@@ -46,5 +46,5 @@ train:
   ckpt_every: 200
   out_dir: checkpoints/train_moe
   device: cuda
-  precision: bf16            # A100 supports bf16; confirmed by the notebook probe
+  precision: bf16            # A100 supports bf16, confirmed by the notebook probe
   require_gpu_name: A100     # refuse to run on a reassigned Colab GPU

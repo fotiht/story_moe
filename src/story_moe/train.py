@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .config import Config, load_config
+from .config import Config, config_from_dict, load_config
 from .data import Batcher, check_cache_matches_config, load_cached_split, load_tokenizer
 from .evaluate import describe_protocol, evaluate_blocks
 from .model import StoryLM, count_parameters, expected_initial_loss
@@ -38,9 +38,9 @@ from .model import StoryLM, count_parameters, expected_initial_loss
 def resolve_device(cfg: Config) -> str:
     """Check the device and precision actually match what the config demands.
 
-    Colab hands out whichever accelerator is free. The dense and MoE runs must
-    share a device and a precision or the comparison is void, so a mismatch is
-    an error here rather than a footnote discovered after both runs finish.
+    Colab hands out whichever accelerator is free. The dense and MoE runs have
+    to share a device and a precision or the comparison is void, so a mismatch
+    stops the run at startup.
     """
     want = cfg.train.device
     if not want.startswith("cuda"):
@@ -67,14 +67,23 @@ def resolve_device(cfg: Config) -> str:
     return want
 
 
+def autocast_for(device: str, precision: str):
+    """An autocast context factory, or nullcontext off CUDA and in fp32."""
+    if not device.startswith("cuda") or precision == "fp32":
+        return nullcontext
+    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    return lambda: torch.autocast("cuda", dtype=dtype)  # noqa: E731
+
+
 def precision_tools(cfg: Config, device: str):
-    """Returns (autocast_factory, scaler). Both are no-ops in fp32."""
-    p = cfg.train.precision
-    if not device.startswith("cuda") or p == "fp32":
-        return nullcontext, None
-    dtype = torch.float16 if p == "fp16" else torch.bfloat16
-    factory = lambda: torch.autocast("cuda", dtype=dtype)  # noqa: E731
-    scaler = torch.amp.GradScaler("cuda") if p == "fp16" else None
+    """Returns (autocast_factory, scaler). Both are no-ops in fp32.
+
+    Only fp16 needs a loss scaler, since bf16 has the exponent range of fp32.
+    """
+    factory = autocast_for(device, cfg.train.precision)
+    scaler = None
+    if device.startswith("cuda") and cfg.train.precision == "fp16":
+        scaler = torch.amp.GradScaler("cuda")
     return factory, scaler
 
 
@@ -108,10 +117,10 @@ def report_parameters(model: StoryLM) -> dict[str, int]:
 
 
 def make_optimizer(model: torch.nn.Module, cfg: Config) -> torch.optim.AdamW:
-    """Weight decay on matrices only; none on LayerNorm gains or biases.
+    """Weight decay on matrices only, none on LayerNorm gains or biases.
 
-    named_parameters() deduplicates shared tensors, so a tied lm_head appears in
-    exactly one group -- it is not decayed twice.
+    named_parameters() deduplicates shared tensors, so a tied lm_head lands in
+    exactly one group.
     """
     decay, no_decay = [], []
     for _, p in model.named_parameters():
@@ -156,8 +165,8 @@ def save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
 def _to_cpu(x):
     """RNG states must be CPU byte tensors. torch.load(map_location='cuda') moves
     every tensor in the payload, RNG states included, and torch.set_rng_state
-    then rejects them. Loading on CPU avoids this; normalizing here as well means
-    a checkpoint written by an older version still restores."""
+    then rejects them. Loading on CPU avoids that. Normalizing here as well
+    means a checkpoint written by an older version still restores."""
     return x.cpu() if isinstance(x, torch.Tensor) else x
 
 
@@ -184,13 +193,34 @@ def checkpoint_payload(
     }
 
 
+def load_for_inference(ckpt_path, device: str, precision: str | None = None):
+    """Rebuild a trained model in eval mode. Returns (model, cfg, checkpoint meta).
+
+    The config comes from inside the checkpoint, so the shapes are always the
+    ones the weights were trained with and a since-edited YAML cannot cause a
+    silent mismatch. Inference needs none of the optimizer, scaler, sampler or
+    RNG state that restore_checkpoint below puts back.
+    """
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = config_from_dict(payload["config"])
+    if precision is not None:
+        cfg.train.precision = precision
+
+    model = StoryLM(cfg)
+    model.load_state_dict(payload["model"])
+    model.to(device).eval()
+
+    meta = {k: payload.get(k) for k in ("step", "processed_tokens", "best_val_nll", "tokenizer")}
+    return model, cfg, meta
+
+
 def restore_checkpoint(payload: dict[str, Any], model, optimizer, scaler, batcher) -> dict:
     """Restore training state. The payload must be loaded with map_location='cpu'.
 
-    load_state_dict copies into the model's existing (already on-device) tensors,
-    and torch.optim moves optimizer state to each parameter's device, so nothing
-    is lost by loading on CPU -- while RNG states, which must stay CPU byte
-    tensors, survive.
+    Nothing is lost by loading on CPU. load_state_dict copies into the model's
+    existing (already on-device) tensors, and torch.optim moves optimizer state
+    onto each parameter's device. The RNG states, which have to stay CPU byte
+    tensors, survive the trip.
     """
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
@@ -231,7 +261,7 @@ def overfit(
 ) -> dict[str, float]:
     """Train on a handful of fixed blocks and confirm the loss collapses.
 
-    A wiring test, not an experiment. If it fails, the bug is in target shifting,
+    This is a wiring test. When it fails, the bug is usually in target shifting,
     the causal mask, parameter registration, or the optimizer step.
     """
     cfg.model.dropout = 0.0
@@ -317,8 +347,8 @@ def train(
     cache = Path(cfg.data.cache_dir)
     train_blocks, train_meta = load_cached_split(cache, "train")
     val_blocks, val_meta = load_cached_split(cache, "validation")
-    # Before anything is counted: a mismatched cache runs fine and reports
-    # processed-token numbers that are wrong by the block-size ratio.
+    # Check before anything is counted. A mismatched cache runs fine and
+    # reports processed-token numbers wrong by the block-size ratio.
     check_cache_matches_config(train_meta, cfg, "train")
     check_cache_matches_config(val_meta, cfg, "validation")
 
@@ -356,9 +386,9 @@ def train(
 
     start_step, processed_tokens, best_val = 0, 0, float("inf")
     if resume:
-        # CPU, always: map_location="cuda" would move the RNG byte tensors to
-        # the GPU and torch.set_rng_state rejects them. A CPU-only resume test
-        # cannot catch this, which is why it is asserted here rather than there.
+        # Load on CPU, always. map_location="cuda" would move the RNG byte
+        # tensors onto the GPU, and torch.set_rng_state rejects those. A
+        # CPU-only resume test never touches that path, so it cannot catch it.
         payload = torch.load(resume, map_location="cpu", weights_only=False)
         state = restore_checkpoint(payload, model, opt, scaler, batcher)
         start_step = state["step"]
@@ -378,9 +408,9 @@ def train(
         for group in opt.param_groups:
             group["lr"] = lr
 
-        # Collecting routing statistics on logging steps only keeps the cost off
-        # the hot path; they are aggregated over every microbatch of the update,
-        # because one microbatch of expert usage is far too noisy to read.
+        # Routing statistics are collected on logging steps only, to keep the
+        # cost off the hot path. They aggregate over every microbatch of the
+        # update, because one microbatch of expert usage is too noisy to read.
         want_stats = is_moe and (step % log_every == 0 or step == total_updates - 1)
         frac_sum = [0.0] * cfg.model.n_experts
         prob_sum = [0.0] * cfg.model.n_experts
@@ -449,9 +479,10 @@ def train(
             if "assignment_fraction" in row:
                 frac = " ".join(f"{v:.3f}" for v in row["assignment_fraction"])
                 prob = " ".join(f"{v:.3f}" for v in row["mean_probability"])
-                # The assignment fractions are the real balance diagnostic. The
-                # auxiliary loss is NOT: with near-uniform probabilities it sits
-                # at 1.0 even when every token goes to the same expert.
+                # The assignment fractions are the real balance diagnostic.
+                # With near-uniform probabilities the auxiliary loss sits at
+                # 1.0 even when every token goes to one expert, so do not read
+                # it as balance.
                 print(f"  routing      assign [{frac}]  prob [{prob}]")
 
         is_last = step == total_updates - 1

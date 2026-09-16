@@ -1,8 +1,8 @@
 """Config validation, and the parity guard for the dense-vs-MoE comparison.
 
-test_dense_and_moe_configs_differ_only_in_feedforward is the one that matters:
-the whole comparison is void if the two runs quietly disagree about context,
-seed, batch size, precision or data. Keep this test passing, or disclose the
+test_dense_and_moe_configs_differ_only_in_feedforward is the one that matters.
+The whole comparison is void if the two runs disagree about context, seed,
+batch size, precision or data. Keep this test passing, or disclose the
 difference in the README.
 """
 

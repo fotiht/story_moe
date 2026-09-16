@@ -1,7 +1,7 @@
 """Training-reliability gates: sampling, cache/config agreement, resume state.
 
 These cover three failure modes that produce *plausible* runs rather than
-crashes, which is what makes them dangerous:
+crashes:
 
   - sampling with replacement while the log claims "one pass"
   - training on a cache whose block size disagrees with the config, so every
@@ -9,7 +9,7 @@ crashes, which is what makes them dangerous:
   - a resume that loses the sampler position
 
 The GPU half of the resume fix (RNG byte tensors must stay on CPU) cannot be
-tested here; it needs an actual CUDA device. See the GPU resume cell in
+tested here. It needs an actual CUDA device. See the GPU resume cell in
 notebooks/story_moe_colab.ipynb.
 """
 
@@ -55,7 +55,7 @@ def test_epoch_boundary_reshuffles_and_counts():
     assert b.epoch == 0 and b.cursor == 8
     assert abs(b.epochs_seen() - 0.8) < 1e-9
 
-    b.next_batch()                            # wraps: 2 left + 2 from the next epoch
+    b.next_batch()                            # wraps, 2 left + 2 from the next epoch
     assert b.epoch == 1
     assert b.epochs_seen() > 1.0
 
@@ -125,7 +125,7 @@ def test_matching_cache_is_accepted():
 
 
 def test_wrong_block_size_is_rejected():
-    """The silent-failure case: a 512 config reading the 128 cache runs fine and
+    """The silent-failure case. A 512 config reading the 128 cache runs fine and
     overcounts processed tokens by 4x."""
     cfg = tiny_cfg()
     meta = good_meta(cfg)
@@ -167,14 +167,15 @@ def test_validation_split_checks_against_val_stories():
 def test_no_call_site_uses_a_missing_batcher_method():
     """Catch a rename that updates some call sites and not others.
 
-    This exact bug shipped: `Batcher.random_batch` became `next_batch`,
+    This exact bug shipped. `Batcher.random_batch` became `next_batch`,
     `train.py` was updated, the CLI in `data.py` was not, and the whole suite
     passed because nothing exercises that display path. The failure surfaced as
     an AttributeError three steps into a Colab session.
 
-    Static rather than behavioural: it walks every `batcher.<attr>` in the
-    package and checks the attribute exists. It only sees call sites where the
-    variable is literally named `batcher`, which is the convention here.
+    The check is static rather than behavioural. It walks every `batcher.<attr>`
+    in the package and confirms the attribute exists. It only sees call sites
+    where the variable is literally named `batcher`, the convention
+    here.
     """
     known = {name for name in dir(Batcher) if not name.startswith("_")}
     problems = []

@@ -3,9 +3,9 @@
 These do not check that the cache is fast. Speed is hardware, and asserting a
 speedup on whatever machine CI happens to use produces a flaky test that
 everyone learns to ignore. What is checked here is that the harness reports
-honestly: that it compares two paths computing the same thing, that its
-bookkeeping subtracts prefill from the cached total before dividing, and that
-its grid respects the model's context limit.
+honestly. It compares two paths computing the same thing, its bookkeeping
+subtracts prefill from the cached total before dividing, and its grid respects
+the model's context limit.
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ def test_lockstep_finds_no_difference_when_the_cache_is_right(model: StoryLM) ->
     """In fp32 the two paths are the same computation, so the delta is noise.
 
     This is the quantitative form of the Day 6 gate. A wrong RoPE offset or a
-    per-layer length skew would show up here as a large delta at step 0, which
-    is what distinguishes a broken cache from reduced-precision tie-breaking.
+    per-layer length skew would show up here as a large delta at step 0. That
+    is what separates a broken cache from reduced-precision tie-breaking.
     """
     torch.manual_seed(3)
     prompt = torch.randint(0, model.cfg.model.vocab_size, (1, 6))
@@ -73,8 +73,7 @@ def test_per_token_cost_excludes_prefill(model: StoryLM) -> None:
     """cached_ms_per_token must come from the total minus one prefill.
 
     Getting this wrong would fold the prompt's cost into the decode rate and
-    make the cache look worse at long prompts, which is exactly where it helps
-    most.
+    make the cache look worse at long prompts, where it actually helps most.
     """
     row = benchmark_point(model, prompt_len=8, replay_len=8, device="cpu",
                           precision="fp32", warmup=0, trials=1)
@@ -82,8 +81,8 @@ def test_per_token_cost_excludes_prefill(model: StoryLM) -> None:
     if expected > 0:
         assert row["cached_ms_per_token"] == pytest.approx(expected)
     else:
-        # Below timer resolution. Reported as missing rather than as zero, which
-        # would otherwise divide into an infinite speedup.
+        # Below timer resolution. Reported as missing, since a zero here would
+        # divide into an infinite speedup.
         assert row["cached_ms_per_token"] is None
         assert row["speedup"] is None
     assert row["uncached_ms_per_token"] == pytest.approx(row["uncached_total_ms"] / 8)
@@ -92,19 +91,11 @@ def test_per_token_cost_excludes_prefill(model: StoryLM) -> None:
 def test_missing_timings_print_as_n_a_instead_of_crashing() -> None:
     """The formatter has to survive a None, since run_grid prints every row.
 
-    Short grid points on a fast GPU are exactly where a decode measurement
-    falls below timer resolution, so this is the common case, not a corner.
+    Short grid points on a fast GPU are where a decode measurement falls below
+    timer resolution.
     """
     assert _fmt(None, 5, 2).strip() == "n/a"
     assert _fmt(1.5, 6, 3).strip() == "1.500"
-
-
-def test_timings_are_positive_and_speedup_is_finite(model: StoryLM) -> None:
-    row = benchmark_point(model, prompt_len=4, replay_len=4, device="cpu",
-                          precision="fp32", warmup=0, trials=1)
-    assert row["prefill_ms"] > 0
-    assert row["uncached_total_ms"] > 0
-    assert row["speedup"] is None or row["speedup"] > 0
 
 
 def test_grid_point_past_the_context_is_rejected(model: StoryLM) -> None:

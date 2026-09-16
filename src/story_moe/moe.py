@@ -18,16 +18,16 @@ Three things here are easy to get wrong and are each pinned by a test:
 
   1. **Only assigned tokens are computed.** The production path gathers each
      expert's tokens, runs one MLP call on them, and scatter-adds the weighted
-     result. Evaluating every expert on every token would be simpler and would
-     defeat the entire point; that version exists only as a test oracle.
+     result. Evaluating every expert on every token is simpler and throws away
+     the sparsity. That version exists here only as a test oracle.
 
-  2. **Selected weights are not detached.** The language loss has to be able to
-     train the router through the selected probabilities. The top-k *indices*
-     are discrete and carry no gradient, but the weights must.
+  2. **Selected weights are not detached.** The language loss trains the router
+     through the selected probabilities. The top-k *indices* are discrete and
+     carry no gradient. The weights carry all of it.
 
   3. **The balancing loss is a Top-k adaptation of the Switch objective**, with
      the assignment fraction taken over k*N assignments rather than N. Its
-     value under perfectly uniform routing is 1, not 0 -- see balance_loss.
+     value under perfectly uniform routing is 1, not 0. See balance_loss.
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ from .config import Config
 class RouterStats:
     """Detached diagnostics for one MoE layer. Never part of the graph."""
 
-    assignment_fraction: list[float]   # over k*N assignments; sums to 1
-    mean_probability: list[float]      # mean full softmax prob per expert; sums to 1
-    router_entropy: float              # nats; ln(E) is maximum uncertainty
+    assignment_fraction: list[float]   # over k*N assignments, sums to 1
+    mean_probability: list[float]      # mean full softmax prob per expert, sums to 1
+    router_entropy: float              # nats, ln(E) is maximum uncertainty
     aux_loss: float
     tokens: int
 
@@ -55,10 +55,9 @@ class RouterStats:
 class FeedForward(nn.Module):
     """Linear(D, width) -> GELU -> Linear(width, D).
 
-    The dense model uses one of these at width `dense_width`; the MoE uses
-    `n_experts` of them at `expert_width`. It lives here rather than in model.py
-    because model.py already imports this module, and the reverse would be a
-    cycle.
+    The dense model uses one of these at width `dense_width`. The MoE uses
+    `n_experts` of them at `expert_width`. It lives here because model.py
+    already imports this module, and defining it there would close the cycle.
     """
 
     def __init__(self, d_model: int, width: int, dropout: float = 0.0, bias: bool = False):
@@ -90,13 +89,13 @@ class SparseMoE(nn.Module):
     def route(self, flat: torch.Tensor):
         """[N, D] -> (probs [N, E], topk_idx [N, k], weights [N, k]).
 
-        Softmax in float32: the router decides which experts see a token, and
-        near-ties there turn into visibly different outputs downstream.
+        Softmax in float32. The router decides which experts see a token, and a
+        near-tie resolved the wrong way changes the output visibly.
         """
         probs = F.softmax(self.router(flat).float(), dim=-1)
         topk_probs, topk_idx = probs.topk(self.top_k, dim=-1)
-        # Renormalize so the selected weights sum to 1 per token. No detach:
-        # this is the path the language loss uses to train the router.
+        # Renormalize so the selected weights sum to 1 per token. No detach.
+        # The language loss trains the router through this path.
         weights = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
         return probs, topk_idx, weights
 
@@ -110,13 +109,13 @@ class SparseMoE(nn.Module):
             L   = E * sum_e f_e * P_e
 
         Under uniform routing f_e = P_e = 1/E, so L = E * E * (1/E)(1/E) = 1.
-        **The balanced value is 1, not 0.** An auxiliary loss sitting near 1 is
-        healthy; do not chase it toward zero.
+        The balanced value is 1, not 0. An auxiliary loss sitting near 1 is
+        healthy, so do not chase it toward zero.
 
-        f_e comes from discrete counts and carries no gradient -- it is detached
-        explicitly so that is obvious rather than incidental. Gradients reach
-        the router through P_e, which uses the full probabilities from BEFORE
-        top-k truncation.
+        f_e comes from discrete counts and carries no gradient. The detach is
+        written out so that reads as deliberate in the code. Gradients reach the
+        router through P_e, which uses the full probabilities from before top-k
+        truncation.
         """
         N, E = probs.shape
         k = self.top_k
@@ -158,9 +157,9 @@ class SparseMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, RouterStats | None]:
         """[B, T, D] -> ([B, T, D], aux_loss or None, stats or None).
 
-        `need_aux=False` skips the balancing reduction entirely, which is what
-        the inference and benchmark paths want: no diagnostic work should
-        distinguish the cached path from the uncached one.
+        `need_aux=False` skips the balancing reduction. Inference and the
+        benchmark want that, so no diagnostic work distinguishes the cached path
+        from the uncached one.
         """
         B, T, D = x.shape
         flat = x.reshape(-1, D)

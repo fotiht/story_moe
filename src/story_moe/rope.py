@@ -10,7 +10,7 @@ angle p * theta_i, where
     b_rot = a*sin(p*theta_i) + b*cos(p*theta_i)
 
 This is the GPT-J / interleaved layout. HuggingFace's Llama and GPT-NeoX rotate
-halves instead -- pair (i, i + Dh/2). Both are valid and mathematically
+halves instead, pairing (i, i + Dh/2). Both are valid and mathematically
 equivalent under a permutation of the feature axis, but tensors from the two
 conventions will not match element-wise. Noted in the README.
 
@@ -18,10 +18,10 @@ Two properties the tests pin down:
 
   - Position 0 is the identity (cos 0 = 1, sin 0 = 0).
   - The rotation is orthogonal per pair, so it preserves norms, and the dot
-    product of a rotated query and a rotated key depends only on the DIFFERENCE
-    of their positions. That relative property is the entire point of RoPE and
-    is what makes a cached key valid forever: a key rotated once at its absolute
-    position stays correct as the sequence grows.
+    product of a rotated query and a rotated key depends only on the difference
+    of their positions. That relative property is the entire point of RoPE, and
+    it is also why the KV cache can store rotated keys. A key rotated once at
+    its absolute position stays correct as the sequence grows.
 
 Q and K are rotated. V is never rotated.
 """
@@ -39,8 +39,8 @@ def rope_tables(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Precompute cos/sin for every position. Both are [max_seq_len, d_head//2].
 
-    Always computed in float32 regardless of the model dtype: the angles are the
-    one place where low precision quietly costs accuracy at long positions.
+    Always computed in float32 regardless of the model dtype. At long positions
+    the angles are where low precision costs real accuracy.
     """
     if d_head % 2 != 0:
         raise ValueError(f"d_head must be even, got {d_head}")
@@ -60,10 +60,9 @@ def apply_rope(
 ) -> torch.Tensor:
     """Rotate [B, H, T, Dh] using absolute positions offset .. offset+T-1.
 
-    `offset` is what makes the KV cache work: a chunk of T new tokens arriving
-    after P cached tokens occupies positions P .. P+T-1, so it is rotated with
-    offset=P. Keys already in the cache were rotated when they arrived and must
-    never be rotated again.
+    A chunk of T new tokens arriving after P cached tokens occupies positions
+    P .. P+T-1, so it is rotated with offset=P. Keys already in the cache were
+    rotated when they arrived and must never be rotated again.
     """
     T, Dh = x.shape[-2], x.shape[-1]
     if offset + T > cos.shape[0]:

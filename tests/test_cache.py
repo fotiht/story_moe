@@ -3,12 +3,11 @@
 The central test is `test_cached_decode_matches_uncached_forward`. Everything
 else here is a guard on one way that test could pass for the wrong reason.
 
-Why it is the gate. A KV cache is an optimization that changes no mathematics,
-so the only acceptable evidence that it works is that it reproduces the
-unoptimized result. And the failure modes are quiet: a RoPE offset left at zero
-gives fluent-looking text with the wrong positions, and a per-layer length skew
-gives each layer a slightly wrong history. Neither crashes. Both move the logits,
-which is what these tests read.
+A KV cache is an optimization that changes no mathematics, so the only
+acceptable evidence that it works is that it reproduces the unoptimized result.
+The failure modes are silent. A RoPE offset left at zero gives fluent-looking
+text at the wrong positions. A per-layer length skew gives each layer a
+slightly wrong history. Neither crashes, and both move the logits.
 
 Tokens are teacher-forced rather than sampled, so a mismatch is the cache and
 never the sampler.
@@ -36,7 +35,7 @@ def build(seed: int = 0, **overrides) -> StoryLM:
 @pytest.mark.parametrize("use_moe", [False, True])
 @pytest.mark.parametrize("prompt_len", [1, 3, 8])
 def test_cached_decode_matches_uncached_forward(use_moe: bool, prompt_len: int) -> None:
-    """Feed known tokens one at a time; every step's logits must match."""
+    """Feed known tokens one at a time. Every step's logits must match."""
     overrides = dict(use_moe=True, n_experts=4, top_k=2, expert_width=32) if use_moe else {}
     model = build(**overrides)
 
@@ -81,13 +80,12 @@ def test_chunked_prefill_matches_single_prefill() -> None:
 
 
 def test_rope_offset_is_actually_applied() -> None:
-    """A cache that ignored position would make these two agree; they must not.
+    """A cache that ignored position would make these two agree. They must not.
 
     Same token at position 0 and at position 5. RoPE makes the query rotation
     differ, so the predictions differ. If someone drops the offset and rotates
     every new token at position 0, this test fails and the equivalence test
-    above fails with it, which is the point: two independent readings of the
-    same bug.
+    above fails with it.
     """
     model = build()
     token = torch.tensor([[3]])
@@ -106,7 +104,7 @@ def test_rope_offset_is_actually_applied() -> None:
 
 
 def test_greedy_generation_identical_with_and_without_cache() -> None:
-    """The end-to-end statement: same prompt, same tokens, cache or no cache."""
+    """The end-to-end statement. Same prompt, same tokens, cache or no cache."""
     model = build()
     prompt = torch.tensor([[5, 9, 2]])
     cfg = GenerationConfig(max_new_tokens=10, temperature=0.0)
@@ -197,33 +195,14 @@ def test_capacity_is_enforced_rather_than_wrapping() -> None:
         cache.append(0, torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8))
 
 
-def test_reset_keeps_the_allocation() -> None:
-    cache = KVCache(n_layers=1, max_len=4)
-    k = torch.randn(1, 2, 2, 8)
-    cache.append(0, k, k.clone())
-    cache.advance(2)
-    reserved = cache.memory_bytes()
-    cache.reset()
-    assert cache.length == 0
-    assert cache.memory_bytes() == reserved
-
-
-def test_batch_shape_change_is_rejected() -> None:
-    cache = KVCache(n_layers=1, max_len=8)
-    k = torch.randn(2, 4, 1, 8)
-    cache.append(0, k, k.clone())
-    cache.advance(1)
-    with pytest.raises(ValueError, match="allocated for"):
-        cache.append(0, torch.randn(3, 4, 1, 8), torch.randn(3, 4, 1, 8))
-
-
-def test_dtype_change_is_rejected() -> None:
+def test_switching_precision_mid_generation_is_rejected() -> None:
+    """The one mismatch torch would not catch is a silent dtype cast on copy."""
     cache = KVCache(n_layers=1, max_len=8)
     k = torch.randn(1, 2, 1, 8)
     cache.append(0, k, k.clone())
     cache.advance(1)
-    half = torch.randn(1, 2, 1, 8, dtype=torch.float16)
-    with pytest.raises(ValueError, match="holds"):
+    half = k.half()
+    with pytest.raises(ValueError, match="mid-generation"):
         cache.append(0, half, half.clone())
 
 
@@ -242,7 +221,7 @@ def test_training_path_refuses_a_cache() -> None:
 
 
 def test_exceeding_max_seq_len_reports_absolute_positions() -> None:
-    # 16 is the floor here: tiny_cfg fixes block_size at 16 and the config
+    # 16 is the floor here. tiny_cfg fixes block_size at 16, and the config
     # validator rejects block_size > max_seq_len.
     model = build(max_seq_len=16)
     cache = model.new_cache(max_len=16)

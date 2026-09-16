@@ -1,12 +1,12 @@
 """Validated configuration objects loaded from YAML.
 
 Every run is described by one YAML file. The dataclasses here are the single
-source of truth for shapes and hyperparameters; nothing else should hardcode a
-dimension. `load_config` validates the invariants the project depends on
-(D == H * Dh, even head dim, k <= E, block_size <= max_seq_len) so a bad config
-fails at startup instead of deep inside a training loop.
+source of truth for shapes and hyperparameters, and nothing else should
+hardcode a dimension. `load_config` checks the invariants the project depends
+on (D == H * Dh, even head dim, k <= E, block_size <= max_seq_len) so a bad
+config fails at startup instead of deep inside a training loop.
 
-Note on vocab_size: it is NOT set in YAML. It is resolved at runtime from the
+vocab_size is deliberately absent from YAML. It is resolved at runtime from the
 tokenizer via len(tokenizer) and written into the config, so the model can never
 disagree with the tokenizer that produced the data.
 """
@@ -33,7 +33,7 @@ class ModelConfig:
     dense_width: int = 512       # intermediate width of the dense MLP
     n_experts: int = 4
     top_k: int = 2
-    expert_width: int = 256      # intermediate width of ONE expert
+    expert_width: int = 256      # intermediate width of a single expert
     aux_loss_weight: float = 0.01
 
     rope_base: float = 10000.0
@@ -41,7 +41,7 @@ class ModelConfig:
     tie_weights: bool = True
     bias: bool = False           # bias-free linear projections (simple param accounting)
 
-    # Resolved from the tokenizer at load time; never written by hand.
+    # Resolved from the tokenizer at load time. Never written by hand.
     vocab_size: int | None = None
 
     def validate(self) -> None:
@@ -66,10 +66,10 @@ class DataConfig:
     val_stories: int = 200
     seed: int = 1234
 
-    block_size: int = 128        # T: tokens the model sees per example
-    # Stride between successive block starts, in tokens. Default block_size means
-    # consecutive blocks share exactly one boundary token, so every token after the
-    # first is a prediction target exactly once and none is wasted.
+    block_size: int = 128        # T, the number of tokens the model sees per example
+    # Stride between successive block starts, in tokens. A stride of block_size
+    # makes consecutive blocks share exactly one boundary token, so every token
+    # after the first is a prediction target exactly once and none is wasted.
     stride: int | None = None
 
     cache_dir: str = "data/cache"
@@ -99,9 +99,8 @@ class TrainConfig:
     out_dir: str = "checkpoints"
 
     # Device/precision pinning. The dense and MoE runs must agree on both or the
-    # comparison in the project spec (same device, same precision) is void. Colab
-    # reassigns GPUs between sessions, so these are asserted at startup rather
-    # than trusted.
+    # comparison in the project spec (same device, same precision) is void.
+    # Colab reassigns GPUs between sessions, so both are checked at startup.
     device: str = "cuda"
     precision: str = "fp32"          # fp32 | fp16 | bf16
     require_gpu_name: str | None = None   # substring match, e.g. "A100"
@@ -130,9 +129,9 @@ class Config:
 def config_from_dict(raw: dict[str, Any]) -> Config:
     """Rebuild a Config from `to_dict()` output, e.g. a checkpoint's own copy.
 
-    Loading a checkpoint this way rather than from a YAML file means the model
-    is always built with the shapes it was trained with, even if the YAML has
-    been edited since.
+    A checkpoint carries the config it was trained under, so the model comes
+    back with the shapes its weights expect even if the YAML has been edited
+    since.
     """
     cfg = Config(
         name=raw.get("name", "checkpoint"),

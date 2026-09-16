@@ -4,8 +4,8 @@ The two tests that matter are the oracle comparisons. A routing bug that
 produces plausible outputs but wrong gradients is the classic way an MoE
 silently fails to train, and nothing except a gradient comparison catches it.
 
-The dense oracle lives HERE and only here. It evaluates every expert on every
-token, which is exactly what the production path must never do.
+The dense oracle lives here and only here. It evaluates every expert on every
+token. The production path must never do that.
 """
 
 import pytest
@@ -34,7 +34,7 @@ def moe():
 
 
 def dense_oracle(module: SparseMoE, x: torch.Tensor) -> torch.Tensor:
-    """Every expert on every token, combined with the SAME Top-k weights.
+    """Every expert on every token, combined with the same Top-k weights.
 
     Correct by construction and hopelessly wasteful. Its only job is to say what
     the sparse path should have produced.
@@ -184,7 +184,7 @@ class ConstRouter(torch.nn.Module):
 
 
 def test_empty_expert_does_not_crash(moe):
-    # experts 2 and 3 always lose: nothing is ever routed to them
+    # experts 2 and 3 always lose, so nothing is ever routed to them
     moe.router = ConstRouter(torch.tensor([5.0, 4.0, -5.0, -6.0]))
     x = torch.randn(2, 16, D)
 
@@ -210,9 +210,9 @@ def test_starved_routing_is_visible_in_the_statistics(moe):
 
 
 def test_balance_loss_is_one_under_uniform_routing(moe):
-    """Not zero. One. A healthy auxiliary loss sits near 1 and stays there.
+    """The balanced value of this loss is 1, and a healthy run sits there.
 
-    Assignments are hand-built rather than routed: a constant router produces
+    Assignments are hand-built rather than routed. A constant router produces
     exact ties, and top-k breaks ties by index, so it cannot actually spread
     tokens evenly. Here every expert gets exactly k*N/E of the assignments.
     """
@@ -282,7 +282,7 @@ def test_dense_model_auxiliary_loss_is_exactly_zero():
 
 
 def test_inference_skips_the_auxiliary_reduction():
-    """Section 12: no diagnostic work may distinguish the two benchmark paths."""
+    """Section 12. No diagnostic work may distinguish the two benchmark paths."""
     m = StoryLM(moe_cfg())
     m.eval()
     with torch.no_grad():
@@ -299,7 +299,7 @@ def test_moe_body_is_larger_than_dense_body():
 
 
 def test_moe_overfits_a_tiny_batch():
-    """Same gate the dense model passed: routing must not block learning."""
+    """Same gate the dense model passed. Routing must not block learning."""
     torch.manual_seed(0)
     m = StoryLM(moe_cfg())
     m.train()

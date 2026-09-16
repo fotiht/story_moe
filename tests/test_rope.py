@@ -1,8 +1,8 @@
 """Day 3 gate: RoPE.
 
 The offset test and the relative-position test are the two that matter. Together
-they are why a key can be rotated once, cached, and stay correct forever -- which
-is the assumption the whole KV cache milestone rests on.
+they are why a key can be rotated once, cached, and stay correct forever. The
+whole KV cache milestone rests on that assumption.
 """
 
 import math
@@ -48,7 +48,7 @@ def test_rotation_preserves_norms():
 
 
 def test_offset_chunk_matches_the_tail_of_a_full_pass():
-    """The KV-cache assumption: rotating a chunk at offset P gives the same
+    """The KV-cache assumption. Rotating a chunk at offset P gives the same
     tensors as rotating the whole sequence from 0 and slicing off the tail."""
     cos, sin = rope_tables(8, 64)
     x = torch.randn(2, 3, 20, 8)
@@ -97,12 +97,13 @@ def test_head_dim_mismatch_rejected():
 
 
 def test_model_has_no_positional_embedding_table():
-    """Day 2's learned positions were deleted, not disabled. Both would be a bug."""
+    """Day 2's learned positions were deleted outright. A table left in place
+    but unused would fail here too."""
     m = StoryLM(tiny_cfg())
     names = [n for n, _ in m.named_parameters()]
     assert not any("pos" in n for n in names), names
     assert hasattr(m, "rope_cos") and hasattr(m, "rope_sin")
-    # RoPE is parameter-free: buffers must not show up as trainable parameters
+    # RoPE is parameter-free, so the buffers must not show up as trainable params
     assert "rope_cos" not in names and "rope_sin" not in names
 
 
@@ -122,7 +123,7 @@ def test_rope_tables_reach_attention():
 
 
 def test_rope_applied_to_q_and_k_only(monkeypatch):
-    """V must never be rotated. Count the calls: two per layer, not three."""
+    """V must never be rotated. Count the calls, two per layer for q and k."""
     calls: list[tuple] = []
     original = attention_module.apply_rope
 
