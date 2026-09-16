@@ -1,0 +1,195 @@
+{
+  "config": {
+    "name": "train_dense",
+    "model": {
+      "n_layers": 6,
+      "d_model": 384,
+      "n_heads": 6,
+      "d_head": 64,
+      "max_seq_len": 512,
+      "use_moe": false,
+      "dense_width": 4096,
+      "n_experts": 4,
+      "top_k": 2,
+      "expert_width": 2048,
+      "aux_loss_weight": 0.01,
+      "rope_base": 10000.0,
+      "dropout": 0.0,
+      "tie_weights": true,
+      "bias": false,
+      "vocab_size": 50257
+    },
+    "data": {
+      "dataset": "roneneldan/TinyStories",
+      "tokenizer": "gpt2",
+      "train_stories": 90000,
+      "val_stories": 2000,
+      "seed": 1234,
+      "block_size": 512,
+      "stride": null,
+      "cache_dir": "/content/drive/MyDrive/story_moe_artifacts/data_cache/cache_512"
+    },
+    "train": {
+      "lr": 0.0003,
+      "weight_decay": 0.1,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "grad_clip": 1.0,
+      "warmup_steps": 60,
+      "microbatch_size": 8,
+      "accum_steps": 4,
+      "max_tokens": 20000000,
+      "eval_every": 200,
+      "ckpt_every": 200,
+      "out_dir": "/content/drive/MyDrive/story_moe_artifacts/checkpoints/train_dense",
+      "device": "cuda",
+      "precision": "bf16",
+      "require_gpu_name": "A100"
+    }
+  },
+  "checkpoint": "/content/drive/MyDrive/story_moe_artifacts/checkpoints/train_dense/latest.pt",
+  "checkpoint_meta": {
+    "step": 1220,
+    "processed_tokens": 19988480,
+    "best_val_nll": 2.3763870478234748,
+    "tokenizer": {
+      "name_or_path": "gpt2",
+      "len": 50257
+    }
+  },
+  "parameters": {
+    "total": 41721984,
+    "embedding": 19298688,
+    "body": 22423296
+  },
+  "device": "NVIDIA A100-SXM4-40GB",
+  "precision": "bf16",
+  "batch_size": 32,
+  "warmup": 2,
+  "trials": 5,
+  "torch_version": "2.11.0+cu128",
+  "rows": [
+    {
+      "prompt_tokens": 64,
+      "replay_tokens": 64,
+      "batch_size": 32,
+      "outputs_agree_fp32": true,
+      "outputs_agree_native": false,
+      "lockstep_fp32": {
+        "steps": 32,
+        "max_logit_delta": 2.09808349609375e-05,
+        "max_logit_magnitude": 15.685046195983887,
+        "relative_delta": 1.3376329721177095e-06,
+        "argmax_disagreements": 0,
+        "first_disagreement": null
+      },
+      "lockstep_native": {
+        "steps": 32,
+        "max_logit_delta": 0.09375,
+        "max_logit_magnitude": 15.6875,
+        "relative_delta": 0.00597609561752988,
+        "argmax_disagreements": 3,
+        "first_disagreement": {
+          "step": 3,
+          "logit_delta": 0.0625,
+          "top2_gap": 0.0,
+          "cached_token": 13,
+          "uncached_token": 13
+        }
+      },
+      "prefill_ms": 9.378623999964475,
+      "cached_total_ms": 527.1381010002187,
+      "uncached_total_ms": 513.3009950000087,
+      "cached_ms_per_token": 8.089991828128973,
+      "uncached_ms_per_token": 8.020328046875136,
+      "speedup": 0.9913888934953413,
+      "cached_best_total_ms": 525.2338330001294,
+      "uncached_best_total_ms": 512.8953190001084,
+      "cached_peak_mib": 295.36474609375,
+      "uncached_peak_mib": 335.3232421875,
+      "cache_reserved_mib": 72.0
+    },
+    {
+      "prompt_tokens": 128,
+      "replay_tokens": 128,
+      "batch_size": 32,
+      "outputs_agree_fp32": true,
+      "outputs_agree_native": false,
+      "lockstep_fp32": {
+        "steps": 32,
+        "max_logit_delta": 1.71661376953125e-05,
+        "max_logit_magnitude": 15.80704402923584,
+        "relative_delta": 1.0859802543450222e-06,
+        "argmax_disagreements": 0,
+        "first_disagreement": null
+      },
+      "lockstep_native": {
+        "steps": 32,
+        "max_logit_delta": 0.09375,
+        "max_logit_magnitude": 15.8125,
+        "relative_delta": 0.005928853754940711,
+        "argmax_disagreements": 2,
+        "first_disagreement": {
+          "step": 18,
+          "logit_delta": 0.0625,
+          "top2_gap": 0.0,
+          "cached_token": 1310,
+          "uncached_token": 1310
+        }
+      },
+      "prefill_ms": 9.218534999945405,
+      "cached_total_ms": 1075.4127200002586,
+      "uncached_total_ms": 1067.4010239999916,
+      "cached_ms_per_token": 8.329642070314947,
+      "uncached_ms_per_token": 8.339070499999934,
+      "speedup": 1.0011319129448057,
+      "cached_best_total_ms": 1058.1483360001585,
+      "uncached_best_total_ms": 1059.8919439999008,
+      "cached_peak_mib": 361.56982421875,
+      "uncached_peak_mib": 414.3701171875,
+      "cache_reserved_mib": 144.0
+    },
+    {
+      "prompt_tokens": 256,
+      "replay_tokens": 256,
+      "batch_size": 32,
+      "outputs_agree_fp32": true,
+      "outputs_agree_native": false,
+      "lockstep_fp32": {
+        "steps": 32,
+        "max_logit_delta": 1.9073486328125e-05,
+        "max_logit_magnitude": 15.191006660461426,
+        "relative_delta": 1.2555775107234166e-06,
+        "argmax_disagreements": 0,
+        "first_disagreement": null
+      },
+      "lockstep_native": {
+        "steps": 32,
+        "max_logit_delta": 0.0859375,
+        "max_logit_magnitude": 14.875,
+        "relative_delta": 0.005777310924369748,
+        "argmax_disagreements": 2,
+        "first_disagreement": {
+          "step": 28,
+          "logit_delta": 0.078125,
+          "top2_gap": 0.0,
+          "cached_token": 389,
+          "uncached_token": 389
+        }
+      },
+      "prefill_ms": 9.733298999890394,
+      "cached_total_ms": 2157.8274880002937,
+      "uncached_total_ms": 3888.522225000088,
+      "cached_ms_per_token": 8.390992925782825,
+      "uncached_ms_per_token": 15.189539941406593,
+      "speedup": 1.8102196099741685,
+      "cached_best_total_ms": 2149.113448999742,
+      "uncached_best_total_ms": 3888.3827960003146,
+      "cached_peak_mib": 516.60107421875,
+      "uncached_peak_mib": 814.80712890625,
+      "cache_reserved_mib": 288.0
+    }
+  ]
+}

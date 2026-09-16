@@ -1,17 +1,101 @@
 # PROJECT_STATUS
 
-Updated: 2026-09-16 (day 5 complete)
+Updated: 2026-09-16 (days 1 to 7 complete)
 
 ## Current milestone
 
-Days 1 to 5 verified. Both full 20M-token runs finished on the same A100 in bf16
-and the headline comparison is measured; see "Day 5 results" below. Day 6 is the
-KV cache, Day 7 is evaluation and benchmarks.
+All seven days are done and measured. Days 1 to 5 as before; Day 6 added the KV
+cache and Day 7 the generation CLI, the cache benchmark and the results tables.
+The suite passes at 111, so the earlier dead-code cleanup is confirmed.
 
-One thing is still written but NOT re-tested: the dead-code removal described
-under "Code cleanup" below. Both full runs completing is strong evidence the
-merge is correct, since every line of it ran for 1,220 updates twice, but the
-suite has not confirmed it. Run `pytest -q`; it should still be 77.
+Nothing in the README is projected any more. Every figure came off a run.
+
+## Day 6 and 7 results
+
+### The cache is correct
+
+The fp32 gate passed at all 22 benchmark grid points on the trained models:
+cached and uncached decode produced identical tokens. The lockstep comparison,
+which feeds both paths the same tokens and compares logits directly, put the
+largest fp32 difference at 2.1e-5 against logits of magnitude 16, a relative
+1e-6. That is reassociation noise, which is what an identity computed two ways
+should look like.
+
+### bf16 token divergence is rounding, not a bug
+
+In bf16 some points decoded different tokens. The lockstep delta there is 0.0625
+at batch 1, which is exactly one ULP: bf16 has 8 mantissa bits, so near 15 the
+spacing is 2^3 * 2^-8 = 0.0625. Several recorded flips had a top-2 gap of
+exactly 0.0, meaning two tokens with identical bf16 logits, where argmax falls
+to index order and any perturbation flips it. One flipped token then makes every
+later token differ, which is why free-running greedy comparison looked like
+total failure.
+
+The benchmark now fails only on an fp32 mismatch and reports bf16 divergence
+with the logit deltas beside it. That change was made after the measurement, not
+before it, and the first version did hard-fail the run.
+
+### Timings, A100, bf16, median of 5 after 2 warmup
+
+| Model | Batch | Prompt | Replay | Prefill ms | Cached ms/tok | Uncached ms/tok | Speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Dense | 1 | 8 | 8 | 9.35 | 7.05 | 8.27 | 1.17x |
+| Dense | 1 | 256 | 256 | 9.14 | 7.97 | 8.13 | 1.02x |
+| Dense | 32 | 64 | 64 | 9.38 | 8.09 | 8.02 | 0.99x |
+| Dense | 32 | 256 | 256 | 9.73 | 8.39 | 15.19 | 1.81x |
+| MoE | 1 | 8 | 8 | 17.25 | 12.38 | 17.69 | 1.43x |
+| MoE | 1 | 256 | 256 | 19.32 | 13.94 | 17.63 | 1.26x |
+| MoE | 32 | 256 | 256 | 19.99 | 17.64 | 25.90 | 1.47x |
+
+### The prediction was wrong, and why
+
+I predicted the per-token speedup would grow roughly linearly with sequence
+length. It does not. Decode at this model size is bound by Python dispatch and
+kernel launch, not arithmetic:
+
+- Dense cached decode costs 7.05 ms/token at 16 tokens of context and 7.97 at
+  512. A 32x range of context, 13% of time.
+- Dense cached decode costs 8.39 ms/token at batch 32, where each step produces
+  32 tokens instead of 1. Thirty-two times the work, 5% more time.
+- Prefill costs 9.35 ms for 8 tokens and 9.73 ms for 8,192.
+
+That is a floor of roughly 8 ms per step dense and 18 ms MoE, under which saved
+arithmetic is invisible. The uncached path matches the cached path until its
+recomputation exceeds that floor. At batch 1 it never does within a 512-token
+context; at batch 32 the crossover sits between 256 and 512 tokens of context
+(8.02 ms at 256, 15.19 at 512).
+
+MoE shows a bigger batch-1 speedup than dense (1.26x to 1.43x against 1.02x to
+1.17x) for the same reason inverted: gather, four experts and scatter put more
+real arithmetic under the same overhead.
+
+Batching is the larger lever: dense cached decode goes from 125 tok/s at batch 1
+to 3,814 tok/s at batch 32, 30x from the same cache, because batching is what
+makes a step compute-bound in the first place.
+
+### The memory prediction did hold
+
+At batch 32 and 512 tokens of context, the cached path peaks at 517 MiB against
+the uncached path's 815 MiB (MoE: 615 against 936), even though only the cached
+path stores keys and values. The uncached path materializes a [32, 6, t, t]
+score matrix every step, which costs more than the cache avoids.
+
+### Bugs found and fixed during Day 7
+
+1. `torch.multinomial` needs its generator on the logits' device. The CLI built
+   a CPU generator against CUDA logits and crashed. The CPU-only tests could not
+   catch this, the same shape as the Day 3 GPU-resume bug.
+2. `default_grid` started at (16, 32) and returned nothing for any model with
+   max_seq_len under 48, so the benchmark refused to run rather than picking
+   smaller points. Caught by its own test.
+3. Fixing 2 exposed a latent crash: at short grid points on a fast GPU,
+   `cached_total - prefill` falls below timer resolution, making the speedup
+   None, which the print line formatted with `:5.2f`. Now prints `n/a`.
+4. The lockstep diagnostic reported batch row 0 rather than the row that
+   actually diverged, so at batch 32 it printed two identical tokens as evidence
+   of a disagreement. Found by reading the run output, not by a test.
+5. `_cache_reserved_mib` computed at fp32 always, overstating a bf16 run's cache
+   by exactly 2x.
 
 ## Day 5 results
 
@@ -293,23 +377,27 @@ expected: the router is an additional thing to learn.
 
 ## Next action
 
-1. `pytest -q` on Windows. Still the only unconfirmed thing from the cleanup.
-   Expect 77.
-2. Commit the updated README and this file, push.
-3. Day 6, the KV cache. Per-layer key and value tensors threaded through
-   `DecoderBlock` and `StoryLM`, a `generate.py` with prefill plus single-token
-   decode, and the test that matters: decoding T tokens one at a time with the
-   cache must match a full uncached forward over the same T tokens to within
-   floating-point tolerance. `offset_causal_mask` was written in its general form
-   on Day 2 for exactly this, so the mask should need arguments, not surgery.
-   `ModelOutput.past_key_values` is already the slot for it.
-4. Day 7, evaluation, cache benchmarks, a generation sample in the README.
+The 7-day plan is finished. Remaining housekeeping:
+
+1. Commit and push the Day 7 fixes and the updated docs.
+2. Copy `bench_dense.json`, `bench_moe.json`, `bench_dense_b32.json` and
+   `bench_moe_b32.json` into the repo under `results/` so the README's tables
+   have their source data beside them. They currently sit in Drive next to the
+   checkpoints.
 
 The trained checkpoints live in Drive under
-`story_moe_artifacts/checkpoints/train_dense` and `.../train_moe`. Day 6's
-cache-equivalence test does not need them (a randomly initialized model tests the
-cache just as well) but Day 7's generation samples do, so do not let them get
-cleaned up.
+`story_moe_artifacts/checkpoints/train_dense` and `.../train_moe`. Keep them:
+they are what any further generation sample or benchmark needs, and retraining
+costs 10 minutes of A100 time but loses the exact weights the README describes.
+
+Optional work, if the project continues past the plan:
+
+- Per-layer routing statistics in the log rather than the six-layer mean, which
+  would answer whether the layers specialize or all route alike.
+- A batch-size sweep on the cache benchmark (1, 4, 16, 32, 64) to locate the
+  overhead crossover properly instead of bracketing it between two points.
+- SDPA in place of the explicit attention, now that the explicit version is the
+  verified reference to match against.
 
 Known annoyance: `device_commit_files` has silently failed to write three times
 in this session (reported success, file unchanged). Always read the file back

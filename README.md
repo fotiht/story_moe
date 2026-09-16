@@ -4,13 +4,14 @@ A next-token language model trained from random initialization on a fixed
 TinyStories subset. It continues short story prompts; it is not an
 instruction-tuned assistant.
 
-Status: day 5 of 7 complete. The data pipeline, causal attention, RoPE, the loss,
-validation, checkpoint/resume and the sparse Top-2 MoE are all verified, the last
-of them against a dense all-experts oracle on outputs and gradients. Resume is
-verified on an A100, not only on CPU. Both full 20M-token runs have finished on
-the same A100 in bf16, so the headline comparison below is measured. The KV
-cache and its benchmarks are Day 6 and Day 7 and do not exist yet; the cache
-benchmark table still reads NOT MEASURED.
+Status: the 7-day plan is complete. The data pipeline, causal attention, RoPE,
+the loss, validation, checkpoint/resume, the sparse Top-2 MoE and the KV cache
+are all verified. The MoE is checked against a dense all-experts oracle on both
+outputs and gradients; the cache is checked against an uncached forward pass, in
+the test suite and again in fp32 on the trained models. Resume is verified on an
+A100, not only on CPU. Both full 20M-token runs finished on the same A100 in
+bf16, and the cache benchmarks ran on the trained checkpoints. Every number in
+this README is measured. Nothing is projected.
 
 ## Setup
 
@@ -43,7 +44,13 @@ python -m story_moe.train resume-smoke --config configs/debug_dense.yaml
 python -m story_moe.train train --config configs/debug_dense.yaml
 python -m story_moe.train train --config configs/debug_dense.yaml --resume checkpoints/debug_dense/latest.pt
 
-# 6. Run the test suite.
+# 6. Sample from a trained checkpoint.
+python -m story_moe.generate --checkpoint checkpoints/train_moe/latest.pt --prompt "Once upon a time" --max-new-tokens 120
+
+# 7. Measure the KV cache against an uncached decode.
+python -m story_moe.benchmark --checkpoint checkpoints/train_moe/latest.pt --precision bf16 --batch-size 32 --out results/bench_moe.json
+
+# 8. Run the test suite.
 pytest -q
 ```
 
@@ -343,9 +350,121 @@ debug run at 255.59 shows the model learning. It saw the same 1,000 stories 4.43
 times, so it is partly memorization. The two 30-update rows are far too short to
 compare against each other.
 
-| Prompt tokens | Replay tokens | Prefill ms | Uncached ms/token | Cached ms/token | Speedup | Peak mem by mode |
-| --- | --- | --- | --- | --- | --- | --- |
-| CONFIG | CONFIG | NOT MEASURED | NOT MEASURED | NOT MEASURED | NOT MEASURED | NOT MEASURED |
+### KV cache
+
+Correctness first, because a speedup from a wrong cache is worth nothing.
+
+The cache is a mathematical identity, so it is verified in fp32, where the
+arithmetic is precise enough to test one. Across all 22 grid points below, the
+cached and uncached paths decoded identical tokens in fp32, and a lockstep
+comparison feeding both paths the same tokens put the largest logit difference
+at **2.1e-5 on logits of magnitude 16**, a relative difference of about 1e-6.
+That is floating-point reassociation, which is what an identity computed two
+ways is supposed to look like.
+
+In bf16 the two paths sometimes decode different tokens, and that is a property
+of bf16 rather than of the cache. The lockstep logit difference in bf16 is
+0.0625 at batch 1, which is exactly one unit in the last place at that magnitude
+(bf16 carries 8 mantissa bits, so near 15 the spacing is 2^3 * 2^-8 = 0.0625).
+Greedy argmax is a discontinuous function of the logits, so a one-ULP difference
+flips the choice whenever the top two candidates are closer together than that,
+and several of the recorded flips happened at a measured top-2 gap of exactly
+0.0, meaning two tokens with identical bf16 logits. One flipped token then makes
+every later token differ. The benchmark therefore fails only on an fp32
+mismatch, and reports bf16 token divergence alongside the logit deltas that
+explain it.
+
+Timings, `NVIDIA A100-SXM4-40GB`, bf16, torch 2.11.0+cu128, median of 5 trials
+after 2 warmup, decode cost excluding prefill:
+
+| Model | Batch | Prompt | Replay | Prefill ms | Cached ms/tok | Uncached ms/tok | Speedup | Cached peak | Uncached peak |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Dense | 1 | 8 | 8 | 9.35 | 7.05 | 8.27 | 1.17x | 248 MiB | 248 MiB |
+| Dense | 1 | 128 | 128 | 9.38 | 7.87 | 8.12 | 1.03x | 250 MiB | 254 MiB |
+| Dense | 1 | 256 | 256 | 9.14 | 7.97 | 8.13 | 1.02x | 252 MiB | 265 MiB |
+| Dense | 32 | 64 | 64 | 9.38 | 8.09 | 8.02 | 0.99x | 295 MiB | 335 MiB |
+| Dense | 32 | 128 | 128 | 9.22 | 8.33 | 8.34 | 1.00x | 362 MiB | 414 MiB |
+| Dense | 32 | 256 | 256 | 9.73 | 8.39 | 15.19 | **1.81x** | 517 MiB | 815 MiB |
+| MoE | 1 | 8 | 8 | 17.25 | 12.38 | 17.69 | 1.43x | 361 MiB | 361 MiB |
+| MoE | 1 | 256 | 256 | 19.32 | 13.94 | 17.63 | 1.26x | 365 MiB | 379 MiB |
+| MoE | 32 | 64 | 64 | 19.62 | 17.52 | 17.60 | 1.00x | 409 MiB | 423 MiB |
+| MoE | 32 | 128 | 128 | 19.39 | 17.53 | 17.86 | 1.02x | 466 MiB | 532 MiB |
+| MoE | 32 | 256 | 256 | 19.99 | 17.64 | 25.90 | **1.47x** | 615 MiB | 936 MiB |
+
+The headline speedup is 1.81x dense and 1.47x MoE, at batch 32 with 512 tokens
+of context. The full grid is in `results/bench_*.json`.
+
+This is a smaller and stranger result than the theory predicts, and the reason
+is the most useful thing the benchmark found.
+
+**Decode at this model size is bound by launch overhead, not by arithmetic.**
+Read the cached column: it barely moves. Dense cached decode costs 7.05 ms/token
+with 16 tokens of context and 7.97 ms/token with 512, and 8.39 ms/token at batch
+32, where each step produces 32 tokens instead of one. Thirty-two times the work
+for 5% more time. Prefill says the same thing louder: 9.35 ms for 8 tokens and
+9.73 ms for 8,192 (batch 32, prompt 256). What is being measured below those
+numbers is Python dispatch and CUDA launch for roughly a hundred small kernels
+per step, and a 41M-parameter model on an A100 does not have enough arithmetic
+per step to surface above it.
+
+That sets a floor of about 8 ms per decode step dense and 18 ms MoE. The
+uncached path costs the same as the cached path until its recomputation grows
+past that floor, which is why the speedup is ~1.0x everywhere except the two
+largest points. At batch 1 the crossover is never reached anywhere in a
+512-token context. At batch 32 it lands between 256 and 512 tokens: at 256 total
+context the uncached path still costs 8.02 ms, and at 512 it costs 15.19.
+
+Three things follow, none of which is "the cache does not work":
+
+- The cache's benefit is bounded by the fraction of a step that is real GPU
+  work. That fraction rises with model size, batch size and context length, and
+  this model is small on all three axes.
+- MoE shows a larger speedup than dense at batch 1 (1.26x to 1.43x against 1.02x
+  to 1.17x) for the same reason in reverse: gather, four experts and scatter put
+  more arithmetic under the same overhead, so removing it matters more.
+- Batching is the larger lever here. Dense cached decode goes from 125 tokens/s
+  at batch 1 to 3,814 tokens/s at batch 32, a 30x improvement from the same
+  cache, because batching is what turns an overhead-bound step into a
+  compute-bound one.
+
+The memory prediction held. At batch 32 with 512 tokens of context the cached
+path peaks at 517 MiB against the uncached path's 815 MiB, and the MoE at 615
+against 936, even though only the cached path stores keys and values. The
+uncached path materializes a `[32, 6, t, t]` score matrix at every step, which
+costs more than the cache it avoids.
+
+A caveat on scope: every number here is one model at one size on one GPU. The
+overhead floor is a property of that combination, not of KV caching.
+
+### What the model writes
+
+From the trained MoE, temperature 0.8, top-k 50, seed 0, one unedited sample:
+
+```
+python -m story_moe.generate --checkpoint <ckpt>/train_moe/latest.pt \
+    --prompt "Once upon a time there was a little girl named Lily" \
+    --max-new-tokens 120 --temperature 0.8 --top-k 50
+```
+
+> Once upon a time there was a little girl named Lily. She loved to play at the
+> park, but her mommy always told her to be careful. Her mommy told her not to be
+> scared because it was not nice for.
+>
+> One day, Lily saw a new toy on the ground. It was a big, furry ball. Lily
+> thought it could be a toy, but her mommy said they could keep it. Lily felt
+> happy and brave. She wanted to play with the ball, but her mommy said it was
+> not a good idea.
+>
+> Lily was happy that the ball was safe and the new ball would come back
+
+Read it for what it is. The syntax is sound: agreement, tense, clause structure
+and the TinyStories register are all there, and the model holds a character name
+across 120 tokens. The discourse is not. Mommy says they can keep the ball and
+then says it is not a good idea; "it was not nice for" stops mid-phrase; the
+last line asserts something no earlier line set up. That is the expected shape
+for 41M parameters at 0.99 passes over 20M tokens, and it is the reason
+perplexity 10.03 should be read as "better than 10.77 under an identical
+protocol" and not as a claim about quality.
 
 ## Limitations
 

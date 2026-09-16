@@ -13,9 +13,21 @@ At generated position t:
 
 So the saving is not mainly in attention. It is that the uncached path re-runs
 every projection, every expert and the output head over the entire prefix, every
-step. Expect the per-token speedup to grow roughly linearly with the sequence
-length, and expect the cached path to use LESS peak memory despite storing keys,
-because the uncached path materializes a [B, H, t, t] score matrix each step.
+step.
+
+That predicts a speedup growing with sequence length. The measured answer is
+more interesting, and it is written here because the prediction was wrong. A
+decode step at this model size has a floor of roughly 8 ms (dense) or 18 ms
+(MoE) on an A100 that is pure Python dispatch and kernel-launch overhead, and
+the saved arithmetic is invisible underneath it. The uncached path costs the
+same as the cached path until its recomputation grows past that floor. At batch
+1 it never does, anywhere in a 512-token context; at batch 32 the crossover
+lands between 256 and 512 tokens of context. Below the crossover the cache buys
+nothing measurable. Above it the saving is real and grows.
+
+The memory prediction did hold: the cached path peaks LOWER despite storing
+keys, because the uncached path materializes a [B, H, t, t] score matrix every
+step.
 
 Honesty notes baked into the numbers below:
 
@@ -155,16 +167,23 @@ def lockstep_compare(
 
         pick_c = lc.argmax(dim=-1)
         pick_u = lu.argmax(dim=-1)
-        if not torch.equal(pick_c, pick_u):
+        differing = (pick_c != pick_u).nonzero().flatten()
+        if differing.numel():
             disagreements += 1
             if first is None:
-                top2 = lu.topk(2, dim=-1).values
+                # Report the row that actually differs. Reporting row 0 instead
+                # prints a pair of identical tokens whenever the batch is larger
+                # than one and some other row is the one that flipped, which
+                # reads as a broken diagnostic rather than a narrow tie.
+                r = int(differing[0].item())
+                top2 = lu[r].topk(2).values
                 first = {
                     "step": step,
-                    "logit_delta": delta,
-                    "top2_gap": (top2[:, 0] - top2[:, 1]).min().item(),
-                    "cached_token": int(pick_c[0].item()),
-                    "uncached_token": int(pick_u[0].item()),
+                    "batch_row": r,
+                    "logit_delta": (lc[r] - lu[r]).abs().max().item(),
+                    "top2_gap": (top2[0] - top2[1]).item(),
+                    "cached_token": int(pick_c[r].item()),
+                    "uncached_token": int(pick_u[r].item()),
                 }
 
         nxt = pick_c.unsqueeze(1)
@@ -298,20 +317,28 @@ def benchmark_point(
         "uncached_best_total_ms": uncached_best,
         "cached_peak_mib": cached_peak,
         "uncached_peak_mib": uncached_peak,
-        "cache_reserved_mib": _cache_reserved_mib(model, prompt_len + replay_len, batch_size),
+        "cache_reserved_mib": _cache_reserved_mib(
+            model, prompt_len + replay_len, batch_size, precision
+        ),
     }
 
 
-def _cache_reserved_mib(model: StoryLM, max_len: int, batch_size: int) -> float:
+def _cache_reserved_mib(
+    model: StoryLM, max_len: int, batch_size: int, precision: str = "fp32"
+) -> float:
     """What the cache buffers cost, from shapes rather than from the allocator.
 
     2 (keys and values) * layers * B * H * max_len * Dh * bytes_per_element.
-    Reported at fp32; under autocast the stored tensors are the autocast dtype,
-    so treat this as an upper bound.
+
+    The element size follows the precision, because the buffers are allocated
+    from the dtype of the first key tensor written into them: under bf16 or fp16
+    autocast that is 2 bytes, not 4. Quoting the fp32 figure for a bf16 run
+    overstates the cache by exactly a factor of two.
     """
     m = model.cfg.model
     elements = 2 * m.n_layers * batch_size * m.n_heads * max_len * m.d_head
-    return elements * 4 / (1024 * 1024)
+    bytes_each = 4 if precision == "fp32" else 2
+    return elements * bytes_each / (1024 * 1024)
 
 
 def run_grid(

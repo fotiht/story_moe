@@ -130,6 +130,12 @@ def test_time_median_ms_discards_warmup() -> None:
 
 def test_cache_reserved_size_follows_the_shape_formula(model: StoryLM) -> None:
     m = model.cfg.model
-    got = _cache_reserved_mib(model, max_len=64, batch_size=2)
-    want = 2 * m.n_layers * 2 * m.n_heads * 64 * m.d_head * 4 / (1024 * 1024)
-    assert got == pytest.approx(want)
+    elements = 2 * m.n_layers * 2 * m.n_heads * 64 * m.d_head
+    assert _cache_reserved_mib(model, 64, 2, "fp32") == pytest.approx(
+        elements * 4 / (1024 * 1024)
+    )
+    # Under autocast the buffers take the autocast dtype, so a bf16 run reserves
+    # half of what the fp32 formula would claim.
+    assert _cache_reserved_mib(model, 64, 2, "bf16") == pytest.approx(
+        elements * 2 / (1024 * 1024)
+    )
