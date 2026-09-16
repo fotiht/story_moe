@@ -1,17 +1,73 @@
 # PROJECT_STATUS
 
-Updated: 2026-09-14 (day 5)
+Updated: 2026-09-16 (day 5 complete)
 
 ## Current milestone
 
-Days 1 to 4 verified. Reliability fixes verified, including on GPU. Both
-experiment configs probed on the A100. The full 20M-token runs are the next
-thing to do; after that, Day 6 is the KV cache and Day 7 is evaluation and
-benchmarks.
+Days 1 to 5 verified. Both full 20M-token runs finished on the same A100 in bf16
+and the headline comparison is measured; see "Day 5 results" below. Day 6 is the
+KV cache, Day 7 is evaluation and benchmarks.
 
-Two changes are written but NOT re-tested: the dead-code removal described under
-"Code cleanup" below, and the prose pass over the docs. Run `pytest -q` before
-the full runs. It should still be 77.
+One thing is still written but NOT re-tested: the dead-code removal described
+under "Code cleanup" below. Both full runs completing is strong evidence the
+merge is correct, since every line of it ran for 1,220 updates twice, but the
+suite has not confirmed it. Run `pytest -q`; it should still be 77.
+
+## Day 5 results
+
+Dense and MoE, 1,220 updates each at 16,384 tokens per update, 19,988,480
+processed tokens, 0.9918 passes, `NVIDIA A100-SXM4-40GB`, bf16, torch
+2.11.0+cu128, one shared 512-token cache.
+
+| | Total params | Body params | Val NLL | Perplexity | Cumulative tok/s | Wall clock | Peak mem |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `train_dense` | 41,721,984 | 22,423,296 | 2.3764 | 10.77 | 102,579 | 195 s | 4,139 MiB |
+| `train_moe` | 60,605,568 | 41,306,880 | 2.3054 | 10.03 | 54,967 | 364 s | 4,648 MiB |
+
+The MoE wins by 0.071 nats, 6.9% lower perplexity, and leads at all seven
+validation points (dense 30.65 / 18.61 / 14.55 / 12.41 / 11.31 / 10.79 / 10.77
+against MoE 28.23 / 17.01 / 13.33 / 11.50 / 10.51 / 10.06 / 10.03). It carries
+1.84 times the body parameters and cost 1.87 times the wall clock, so this is a
+matched-token win, not a compute-matched one. Neither curve has flattened.
+
+```
+dense  step     0/1220  lm 10.9144  gn 7.61   24,664 tok/s
+dense  step  1219/1220  lm  2.3408  gn 1.02  102,579 tok/s
+moe    step     0/1220  lm 10.8465  aux 1.0214  gn 7.21   14,765 tok/s
+moe    step  1219/1220  lm  2.2724  aux 1.0220  gn 0.73   54,967 tok/s
+```
+
+Both step-0 language losses sit within 0.09 of ln(50257) = 10.825, so the
+initial-loss assertion held at the experiment tier too.
+
+MoE gradient norms ran consistently below dense in steady state, about 0.73
+against 1.02 at the last step. Not investigated; noting it rather than
+explaining it.
+
+### Routing over the full run
+
+The imbalance the 30-update probe showed forming did not continue. Fractions
+averaged over the six MoE layers and the four microbatches of the logged update:
+
+```
+step    0  [0.277 0.234 0.235 0.254]  max/min 1.18  aux 1.0214
+step  100  [0.265 0.314 0.222 0.199]  max/min 1.58  aux 1.0588
+step  200  [0.256 0.288 0.225 0.232]  max/min 1.28  aux 1.0276
+step  600  [0.257 0.283 0.222 0.238]  max/min 1.27  aux 1.0203
+step 1219  [0.259 0.286 0.218 0.237]  max/min 1.31  aux 1.0220
+```
+
+Worst point is step 100, at the end of the 60-update warmup. From step 200 on the
+fractions hold a stable band, max/min 1.27 to 1.32, no expert under 0.21. The
+probe's max/min of 1.97 at step 20 was a transient, and reading 30 updates as a
+trend was the wrong call. `aux` moved across a range of about 0.04 over the whole
+run while the fractions moved visibly, which is one more reason not to use it as
+the balance diagnostic.
+
+Caveat on the numbers above: the log records the layer average, so per-layer skew
+in opposite directions would partly cancel. `RouterStats` is collected per layer;
+only the mean is written out. Worth a per-layer dump on Day 7 if expert behaviour
+gets discussed at all.
 
 ### Verified on the A100 (torch 2.11.0+cu128, bf16)
 
@@ -174,7 +230,8 @@ At the larger tier the totals are 41.72M against 60.60M (bodies 22.42M against
 41.30M) with a 46% embedding share. New: `configs/train_dense.yaml`,
 `configs/train_moe.yaml`.
 
-Budget: 20M processed tokens over 90,000 stories, which is 0.98 passes. (Sampling is
+Budget: 20M processed tokens over 90,000 stories, which the runs confirmed at
+0.9918 passes. (Sampling is
 now without replacement, so this ratio is genuine coverage; with the previous
 `torch.randint` sampler the same budget would have reached only 63% of blocks.)
 The spec's 1M to 5M suggestion is 18 to 90 seconds on this GPU; there is no reason to be that
@@ -236,18 +293,23 @@ expected: the router is an additional thing to learn.
 
 ## Next action
 
-Run `pytest -q` on Windows to confirm the code cleanup did not break anything,
-push, then in Colab run the two full 20M-token experiments on the same GPU and
-precision:
+1. `pytest -q` on Windows. Still the only unconfirmed thing from the cleanup.
+   Expect 77.
+2. Commit the updated README and this file, push.
+3. Day 6, the KV cache. Per-layer key and value tensors threaded through
+   `DecoderBlock` and `StoryLM`, a `generate.py` with prefill plus single-token
+   decode, and the test that matters: decoding T tokens one at a time with the
+   cache must match a full uncached forward over the same T tokens to within
+   floating-point tolerance. `offset_causal_mask` was written in its general form
+   on Day 2 for exactly this, so the mask should need arguments, not surgery.
+   `ModelOutput.past_key_values` is already the slot for it.
+4. Day 7, evaluation, cache benchmarks, a generation sample in the README.
 
-```
-python -m story_moe.train train --config configs/train_dense.yaml --data-cache "$CACHE/cache_512" --out-dir "$CKPT/train_dense" --precision bf16 --require-gpu-name A100
-python -m story_moe.train train --config configs/train_moe.yaml --data-cache "$CACHE/cache_512" --out-dir "$CKPT/train_moe" --precision bf16 --require-gpu-name A100
-```
-
-About 8 minutes for the pair. Copy `results/*.json` to Drive before the session
-ends. Then Day 6 is the KV cache and Day 7 is evaluation, benchmarks and the
-README results tables.
+The trained checkpoints live in Drive under
+`story_moe_artifacts/checkpoints/train_dense` and `.../train_moe`. Day 6's
+cache-equivalence test does not need them (a randomly initialized model tests the
+cache just as well) but Day 7's generation samples do, so do not let them get
+cleaned up.
 
 Known annoyance: `device_commit_files` has silently failed to write three times
 in this session (reported success, file unchanged). Always read the file back
